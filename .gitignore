@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+.env
+
+# Catalog database and the raw landing zone are outputs, not source.
+data/observer.sqlite*
+data/raw/
