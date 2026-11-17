@@ -49,6 +49,13 @@ uv run gis-observer seeds urls athena_results.csv                            # a
 uv run gis-observer check                                                    # are endpoints up?
 ```
 
+Every response a harvest receives is kept under `data/raw/`. After a parser fix,
+rebuild history from those files into a new catalog without fetching anything:
+
+```sh
+uv run gis-observer replay --out data/replayed.sqlite            # optional: --endpoint ID, --since 2026-11-16
+```
+
 ## Querying the catalog
 
 Everything is in `data/observer.sqlite`. The `current_assets` view is the live catalog:

@@ -153,6 +153,16 @@ class Store:
     def commit(self) -> None:
         self.db.commit()
 
+    def copy_to(self, path: Path | str) -> None:
+        """Write a consistent copy of the whole catalog to `path`."""
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.db.commit()
+        dest = sqlite3.connect(str(path))
+        try:
+            self.db.backup(dest)
+        finally:
+            dest.close()
+
     # -- jurisdictions -------------------------------------------------------------
 
     def upsert_jurisdictions(self, rows: Iterable[Jurisdiction]) -> int:
@@ -271,18 +281,19 @@ class Store:
 
     # -- harvests and assets -------------------------------------------------------
 
-    def start_harvest(self, endpoint_id: str) -> int:
+    def start_harvest(self, endpoint_id: str, started_at: str | None = None) -> int:
         cur = self.db.execute(
-            "INSERT INTO harvests (endpoint_id, started_at) VALUES (?, ?)", (endpoint_id, utcnow())
+            "INSERT INTO harvests (endpoint_id, started_at) VALUES (?, ?)",
+            (endpoint_id, started_at or utcnow()),
         )
         self.db.commit()
         return cur.lastrowid
 
     def finish_harvest(
         self, harvest_id: int, endpoint_id: str, *, status: str, counts: dict, n_assets: int,
-        n_candidates: int, errors: list[str], raw_path: str | None,
+        n_candidates: int, errors: list[str], raw_path: str | None, finished_at: str | None = None,
     ) -> None:  # fmt: skip
-        now = utcnow()
+        now = finished_at or utcnow()
         self.db.execute(
             """UPDATE harvests SET finished_at=?, status=?, n_assets=?, n_new=?, n_changed=?,
                  n_removed=?, n_candidates=?, errors=?, raw_path=? WHERE id=?""",
@@ -298,14 +309,16 @@ class Store:
         self.db.commit()
 
     def apply_assets(
-        self, endpoint_id: str, harvest_id: int, assets: Iterable[Asset], *, complete: bool
-    ) -> dict[str, int]:
+        self, endpoint_id: str, harvest_id: int, assets: Iterable[Asset], *, complete: bool,
+        observed_at: str | None = None,
+    ) -> dict[str, int]:  # fmt: skip
         """Write one harvest's assets and record what changed since the last one.
 
         Only a complete harvest can mark assets removed; after a partial one, missing
-        assets may just be behind a request that failed.
+        assets may just be behind a request that failed. `observed_at` defaults to now;
+        a replay passes the original harvest's time so history keeps its dates.
         """
-        now = utcnow()
+        now = observed_at or utcnow()
         existing = {
             r["key"]: (r["content_hash"], r["removed_at"])
             for r in self.db.execute(
@@ -369,6 +382,16 @@ class Store:
         )
         self.db.commit()
         return counts
+
+    def forget_harvests(self, endpoint_id: str) -> None:
+        """Drop an endpoint's harvests, assets and history, ready to rebuild them."""
+        for table in ("asset_versions", "assets", "harvests"):
+            self.db.execute(f"DELETE FROM {table} WHERE endpoint_id = ?", (endpoint_id,))
+        self.db.execute(
+            "UPDATE endpoints SET last_harvest_at = NULL, last_harvest_status = NULL WHERE id = ?",
+            (endpoint_id,),
+        )
+        self.db.commit()
 
     def record_check(self, endpoint_id: str, resp, detail: str | None) -> None:
         self.db.execute(

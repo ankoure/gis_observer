@@ -14,6 +14,7 @@ from .discovery.govsearch import read_gis_links
 from .http import DEFAULT_USER_AGENT, Fetcher
 from .models import Platform
 from .store import Store
+from .util import parse_when
 
 DEFAULT_DB = Path(os.environ.get("GIS_OBSERVER_DB", "data/observer.sqlite"))
 DEFAULT_RAW = Path(os.environ.get("GIS_OBSERVER_RAW", "data/raw"))
@@ -84,6 +85,21 @@ def build_parser() -> argparse.ArgumentParser:
     h.add_argument("--limit", type=int)
     h.add_argument("--concurrency", type=int, default=6)
     h.set_defaults(func=cmd_harvest)
+
+    rp = sub.add_parser(
+        "replay",
+        help="rebuild harvest history from raw files into a copy of the catalog",
+        description=(
+            "Copy the catalog to --out, then re-run today's harvesters over the raw files, "
+            "oldest first, with each harvest keeping its original time. Each replayed "
+            "endpoint's harvests, assets and history are rebuilt from scratch; nothing is "
+            "fetched and --db is not changed. Check the copy, then swap it in."
+        ),
+    )
+    rp.add_argument("--out", type=Path, required=True, help="new catalog to write (must not exist)")
+    rp.add_argument("--endpoint", nargs="*", default=None, help="only these endpoint ids")
+    rp.add_argument("--since", help="only raw files written on or after this date/time (ISO, UTC)")
+    rp.set_defaults(func=cmd_replay)
 
     k = sub.add_parser("check", help="record whether endpoints are up")
     k.add_argument("--platform", nargs="*", choices=PLATFORMS, default=None)
@@ -157,6 +173,30 @@ def cmd_harvest(args, store: Store) -> None:
             )  # fmt: skip
 
     asyncio.run(go())
+
+
+def cmd_replay(args, store: Store) -> int:
+    since = None
+    if args.since:
+        since = parse_when(args.since)
+        if since is None:
+            print(f"can't read --since {args.since!r}; use a date like 2026-11-16")
+            return 2
+    if args.out.exists() or args.out.resolve() == args.db.resolve():
+        print(f"{args.out} already exists; replay only writes a new catalog")
+        return 2
+    store.copy_to(args.out)
+    out = Store(args.out)
+    try:
+        totals = asyncio.run(pipeline.run_replay(out, args.raw_dir, ids=args.endpoint, since=since))
+    finally:
+        out.close()
+    print(
+        f"replayed {totals['files']} raw files for {totals['endpoints']} endpoints into "
+        f"{args.out}"
+        + (f" ({totals['skipped']} unreadable files skipped)" if totals["skipped"] else "")
+    )
+    return 0
 
 
 def cmd_check(args, store: Store) -> None:

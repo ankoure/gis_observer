@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -19,9 +19,9 @@ from .classify import classify
 from .discovery.crawl import crawl_site
 from .discovery.probe import probe
 from .harvesters import Harvester
-from .http import Fetcher
+from .http import Fetcher, HttpGetter
 from .models import Asset, Candidate, Endpoint, Platform
-from .raw import RawCapture, raw_path
+from .raw import RawCapture, ReplayFetcher, raw_files, raw_path
 from .store import Store
 
 log = logging.getLogger(__name__)
@@ -126,10 +126,36 @@ async def run_harvest(
 
 async def harvest_one(store: Store, fetcher: Fetcher, raw_dir: Path, endpoint: Endpoint) -> str:
     capture = RawCapture(fetcher)
-    harvester = Harvester.for_platform(endpoint.platform, capture)
+    return await _harvest(
+        store, capture, endpoint, save_raw=lambda: capture.write(raw_path(raw_dir, endpoint))
+    )
+
+
+async def replay_one(store: Store, path: Path, endpoint: Endpoint) -> str:
+    """Re-run the endpoint's harvester over one raw file, dated as the original harvest."""
+    replay = ReplayFetcher(path)
+    status = await _harvest(
+        store, replay, endpoint, save_raw=lambda: path,
+        started_at=replay.started_at, finished_at=replay.finished_at,
+    )  # fmt: skip
+    if replay.misses:
+        log.warning(
+            "%s: %d requests not in the raw file, e.g. %s",
+            path,
+            len(replay.misses),
+            replay.misses[0],
+        )
+    return status
+
+
+async def _harvest(
+    store: Store, http: HttpGetter, endpoint: Endpoint, *, save_raw: Callable[[], Path | None],
+    started_at: str | None = None, finished_at: str | None = None,
+) -> str:  # fmt: skip
+    harvester = Harvester.for_platform(endpoint.platform, http)
     if harvester is None:
         return "unsupported"
-    harvest_id = store.start_harvest(endpoint.id)
+    harvest_id = store.start_harvest(endpoint.id, started_at)
     assets: list[Asset] = []
     found: list[Candidate] = []
     try:
@@ -141,12 +167,15 @@ async def harvest_one(store: Store, fetcher: Fetcher, raw_dir: Path, endpoint: E
 
     errors = harvester.errors
     status = "ok" if not errors else ("partial" if assets else "failed")
-    path = capture.write(raw_path(raw_dir, endpoint))
-    counts = store.apply_assets(endpoint.id, harvest_id, assets, complete=status == "ok")
+    path = save_raw()
+    counts = store.apply_assets(
+        endpoint.id, harvest_id, assets, complete=status == "ok", observed_at=finished_at
+    )
     ingest_candidates(store, found)
     store.finish_harvest(
         harvest_id, endpoint.id, status=status, counts=counts, n_assets=len(assets),
         n_candidates=len(found), errors=errors, raw_path=str(path) if path else None,
+        finished_at=finished_at,
     )  # fmt: skip
     log.info(
         "%s %s: %s, %d assets (+%d new, %d changed, %d removed), %d leads%s",
@@ -154,6 +183,44 @@ async def harvest_one(store: Store, fetcher: Fetcher, raw_dir: Path, endpoint: E
         counts["removed"], len(found), f", {len(errors)} errors" if errors else "",
     )  # fmt: skip
     return status
+
+
+async def run_replay(
+    store: Store, raw_dir: Path, *, ids: list[str] | None = None, since: datetime | None = None
+) -> dict[str, int]:
+    """Rebuild harvest history from raw files, oldest first, without fetching anything.
+
+    Every endpoint with raw files (at or after `since`) starts again from an empty
+    catalog: its harvests, assets and versions are dropped, then each file is replayed
+    through today's harvester. Endpoints without raw files are left as they are.
+    Run this on a copy of the catalog; see `gis-observer replay`.
+    """
+    endpoints = store.endpoints(ids=ids)
+    known = {ep.id for ep in endpoints}
+    for missing in sorted(set(ids or ()) - known):
+        log.warning("no endpoint %s in the catalog", missing)
+    if not ids:
+        orphans = {d.name for d in Path(raw_dir).glob("*/*") if d.is_dir()} - known
+        if orphans:
+            log.warning("%d raw folders have no endpoint in the catalog; skipped", len(orphans))
+
+    totals = {"endpoints": 0, "files": 0, "skipped": 0}
+    for ep in endpoints:
+        files = raw_files(raw_dir, ep, since)
+        if not files or ep.platform not in Harvester.platforms():
+            continue
+        store.forget_harvests(ep.id)
+        totals["endpoints"] += 1
+        for path in files:
+            try:
+                status = await replay_one(store, path, ep)
+            except (OSError, EOFError, ValueError, KeyError) as exc:  # truncated or garbled file
+                log.error("can't replay %s: %r", path, exc)
+                totals["skipped"] += 1
+                continue
+            totals["files"] += 1
+            log.info("%s %s: replayed %s -> %s", ep.platform, ep.url, path.name, status)
+    return totals
 
 
 # Cheapest request that shows each kind of endpoint is up. Ported from the Munger's

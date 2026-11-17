@@ -91,9 +91,26 @@ report a removal once an asset has been missing for two consecutive complete har
 
 Each harvest writes every response it received to
 `data/raw/<platform>/<endpoint id>/<UTC timestamp>.jsonl.gz`. That matches the old
-Airflow DAGs' `s3://restservicejson/{date}/{type}/{server}/{service}.json`. A parser
-fix can be replayed over history without re-fetching. Moving this to S3 later means
-replacing `RawCapture.write`.
+Airflow DAGs' `s3://restservicejson/{date}/{type}/{server}/{service}.json`. Moving
+this to S3 later means replacing `RawCapture.write`.
+
+**Replay.** `gis-observer replay --out NEW.sqlite [--endpoint ID ...] [--since DATE]`
+re-runs today's harvesters over the raw files without fetching anything, so a parser
+fix can be applied to history. `ReplayFetcher` stands in for the network: it answers
+each request from the raw file, matched on method, requested URL and params. A
+request the file doesn't have (a fixed parser asking for something new) fails, so
+that harvest is partial and can't mark assets removed.
+
+- Replay writes a copy. `--out` gets a copy of `--db` (which is never changed) and
+  must not exist yet. Check the copy, then swap it in. Rewriting history in place
+  would mix old and new parses if a replay stopped halfway.
+- Each endpoint with raw files starts over. Its harvests, assets and versions are
+  dropped, then its files are replayed oldest first. Endpoints without raw files keep
+  what they had. `--since` skips older files, so that endpoint's history starts at
+  that date.
+- Harvests keep their original dates. A harvest's start is the first response's
+  `fetched_at`; its finish, and the `observed_at` of its changes, is the file's
+  timestamp.
 
 ## Politeness
 
