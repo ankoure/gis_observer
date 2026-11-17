@@ -8,7 +8,7 @@ import logging
 import os
 from pathlib import Path
 
-from . import pipeline
+from . import changes, pipeline
 from .discovery import seeds
 from .discovery.govsearch import read_gis_links
 from .http import DEFAULT_USER_AGENT, Fetcher
@@ -107,6 +107,22 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("--platform", nargs="*", choices=PLATFORMS, default=None)
     k.add_argument("--limit", type=int)
     k.set_defaults(func=cmd_check)
+
+    ch = sub.add_parser(
+        "changes",
+        help="list what changed on endpoints recently",
+        description=(
+            "List, by endpoint, assets that were new, changed, removed or returned, and "
+            "endpoints whose checks failed. An endpoint's first harvest is one line."
+        ),
+    )
+    ch.add_argument(
+        "--since", default="30d", help="a span like 30d, 12h, 2w, or a date (default %(default)s)"
+    )
+    ch.add_argument("--endpoint", nargs="*", default=None, help="endpoint ids")
+    ch.add_argument("--platform", nargs="*", choices=PLATFORMS, default=None)
+    ch.add_argument("--kind", nargs="*", default=None, help="asset kinds, e.g. layer table")
+    ch.set_defaults(func=cmd_changes)
 
     r = sub.add_parser("report", help="summarise the catalog")
     r.set_defaults(func=cmd_report)
@@ -219,11 +235,66 @@ def _table(title: str, rows, headers: list[str]) -> None:
     if not rows:
         print("  (none)")
         return
+    _aligned([headers, *rows])
+
+
+def _aligned(rows, indent: str = "  ") -> None:
     data = [[("" if v is None else str(v)) for v in r] for r in rows]
-    widths = [max(len(h), *(len(r[i]) for r in data)) for i, h in enumerate(headers)]
-    print("  " + "  ".join(h.ljust(w) for h, w in zip(headers, widths, strict=True)))
+    widths = [max(len(r[i]) for r in data) for i in range(len(data[0]))]
     for r in data:
-        print("  " + "  ".join(v.ljust(w) for v, w in zip(r, widths, strict=True)))
+        print((indent + "  ".join(v.ljust(w) for v, w in zip(r, widths, strict=True))).rstrip())
+
+
+def _when(iso: str | None) -> str:
+    return iso[:16].replace("T", " ") if iso else ""
+
+
+def cmd_changes(args, store: Store) -> int:
+    since = changes.parse_since(args.since)
+    if since is None:
+        print(f"can't read --since {args.since!r}; use a span like 30d or a date like 2026-11-16")
+        return 2
+    cutoff = since.isoformat(timespec="seconds")
+    filters = {"ids": args.endpoint, "platforms": args.platform}
+    print(f"changes since {_when(cutoff)} UTC")
+
+    endpoints = changes.asset_changes(store, cutoff, kinds=args.kind, **filters)
+    if not endpoints:
+        print("\n  (no asset changes)")
+    for ep in endpoints:
+        print(f"\n{ep.platform}  {ep.endpoint_url}  [{ep.endpoint_id}]")
+        rows = []
+        if ep.first_harvest:
+            at, n = ep.first_harvest
+            rows.append([_when(at), "first harvest", f"{n} assets", "", ""])
+        rows += [
+            [_when(a["observed_at"]), a["change"], a["kind"], a["name"] or a["key"],
+             ", ".join(a["fields"])]
+            for a in ep.assets
+        ]  # fmt: skip
+        _aligned(rows)
+
+    down = changes.health(store, cutoff, **filters)
+    print("\nendpoint health: failed checks")
+    if not down:
+        print("  (none)")
+        return 0
+    _aligned(
+        [
+            [h.state, h.platform, h.endpoint_url, f"{h.failed}/{h.checks} failed",
+             _health_note(h)]
+            for h in down
+        ]
+    )  # fmt: skip
+    return 0
+
+
+def _health_note(h: changes.Health) -> str:
+    if h.state == "recovered":
+        return f"up again {_when(h.latest_at)}"
+    status = f"HTTP {h.http_status}" if h.http_status else (h.detail or "no response")
+    up = f"last up {_when(h.last_up_at)}" if h.last_up_at else "never up"
+    return f"down since {_when(h.down_since)} ({status}; {up})"
 
 
 def cmd_report(args, store: Store) -> None:

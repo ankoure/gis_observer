@@ -4,10 +4,15 @@ One harvester for every portal that publishes Project Open Data metadata: Socrat
 ArcGIS Hub (/api/feed/dcat-us/1.1.json), CKAN with ckanext-dcat, OpenDataSoft, and
 federal agencies. Datasets are kept if a distribution is geospatial or the dataset
 has a bounding box.
+
+A Hub site's feed can be broken on the site's side ("Site catalog is not configured
+correctly"). The organisation that owns the site is still there, so when a Hub feed
+fails its ArcGIS Online portal is yielded as a lead for the portal harvester.
 """
 
 from __future__ import annotations
 
+from ..arcgis_online import hub_site_portal
 from ..formats import SERVICE_FORMATS, geo_format
 from ..models import Asset, Platform
 from ..util import compact, parse_when, spatial_bbox, trim
@@ -19,11 +24,16 @@ class DCATHarvester(Harvester):
 
     async def harvest(self, endpoint):
         data = await self.get_json(endpoint.url, max_bytes=300_000_000)
-        if data is None:
-            return
         datasets = data.get("dataset") if isinstance(data, dict) else data  # v1.0 was a bare list
         if not isinstance(datasets, list):
-            self.errors.append(f"{endpoint.url}: no dataset list")
+            if data is not None:
+                self.errors.append(f"{endpoint.url}: no dataset list")
+            if "/api/feed/dcat" in endpoint.url.lower():  # Hub's feed path
+                portal = await hub_site_portal(self.http, endpoint.url)
+                if portal:
+                    yield self.candidate(
+                        endpoint, portal, found_on=endpoint.url, text="ArcGIS Online organisation"
+                    )
             return
         for ds in datasets:
             if isinstance(ds, dict):

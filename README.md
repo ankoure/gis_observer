@@ -40,6 +40,15 @@ assets. Harvests also produce leads: a CKAN dataset that points at an ArcGIS ser
 or an ArcGIS Online item hosted on a county server. Those become endpoints, so
 running `probe` and `harvest` again widens the catalog.
 
+To see what changed, run `changes`. It lists each endpoint's new, changed, removed and
+returned assets, and the fields that differ for each changed one. An endpoint's first
+harvest shows as one line. Below that it lists endpoints whose latest check failed, or
+that failed and came back up:
+
+```sh
+uv run gis-observer changes --since 30d            # optional: --endpoint ID, --platform P, --kind layer
+```
+
 Other sources:
 
 ```sh

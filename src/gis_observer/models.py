@@ -66,7 +66,18 @@ class Endpoint:
         /arcgis/ and /ArcGIS/. Hosted servers on *.arcgis.com are the exception: the
         org id in services.arcgis.com/<orgId>/ is case-sensitive. `url` itself keeps
         the spelling first seen, since that's one known to work.
+
+        A vendor viewer is reached by many spellings of one URL: http or https, host
+        aliases (www.axisgis.com, next.axisgis.com) and any case of the town slug. So a
+        viewer is the vendor plus the lowercased town slug for path-scoped viewers
+        (axisgis.com/HampdenMA), or the vendor plus the host for the others
+        (amherstma.mapgeo.io). classify() keeps a path only for path-scoped viewers.
         """
+        if self.platform is Platform.VIEWER:
+            parts = urlsplit(self.url)
+            slug = parts.path.strip("/").split("/")[0].lower()
+            where = f"/{slug}" if slug else (parts.hostname or "").lower()
+            return f"{self.vendor or ''}|{where}"
         if self.platform is Platform.ARCGIS_REST:
             host = urlsplit(self.url).hostname or ""
             if not (host == "arcgis.com" or host.endswith(".arcgis.com")):
