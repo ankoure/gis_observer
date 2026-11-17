@@ -223,6 +223,12 @@ def test_crawl_records_why_nothing_was_fetched():
     assert asyncio.run(go({"https://www.town.gov/robots.txt": robots})).failure == "robots"
     assert asyncio.run(go({})).failure == "http_404"
 
+    def refuse(request):
+        raise httpx.ConnectError("connection refused", request=request)
+
+    dead = asyncio.run(go({"https://www.town.gov": refuse}))
+    assert (dead.pages, dead.failure) == (0, "dead")
+
 
 def test_osm_seeds_take_state_and_kind(tmp_path):
     from gis_observer.discovery.seeds import load_osm_seeds

@@ -168,7 +168,9 @@ def cmd_seeds(args, store: Store) -> None:
         store.commit()
         print(f"{len(eps)} ArcGIS servers loaded")
     else:
-        new, classified = pipeline.ingest_candidates(store, seeds.load_url_list(args.file))
+        new, classified = pipeline.ingest_candidates(
+            store, store.attribute_by_host(seeds.load_url_list(args.file))
+        )
         print(f"{new} new candidates, {classified} recognised")
 
 
