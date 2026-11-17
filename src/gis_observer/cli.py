@@ -108,6 +108,11 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("--limit", type=int)
     k.set_defaults(func=cmd_check)
 
+    a = sub.add_parser(
+        "attribute", help="credit endpoints to the jurisdictions they're named for or found under"
+    )
+    a.set_defaults(func=cmd_attribute)
+
     r = sub.add_parser("report", help="summarise the catalog")
     r.set_defaults(func=cmd_report)
     return p
@@ -212,6 +217,11 @@ def cmd_check(args, store: Store) -> None:
     asyncio.run(go())
 
 
+def cmd_attribute(args, store: Store) -> None:
+    changes = store.attribute_all()
+    print(", ".join(f"{rel} {n:+d}" for rel, n in changes.items()))
+
+
 def _table(title: str, rows, headers: list[str]) -> None:
     print(f"\n{title}")
     if not rows:
@@ -231,7 +241,7 @@ def cmd_report(args, store: Store) -> None:
     _table(
         "coverage: what each jurisdiction's discovery found",
         [tuple(r) for r in store.coverage()],
-        ["state", "total", "own domain", "linked only", "crawl failed", "nothing found",
+        ["state", "total", "own endpoint", "linked only", "crawl failed", "nothing found",
          "not crawled"],
     )  # fmt: skip
     _table(

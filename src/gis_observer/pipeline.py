@@ -27,6 +27,22 @@ from .store import Store
 log = logging.getLogger(__name__)
 
 
+def attach(
+    store: Store, ep: Endpoint, *, via: str, jurisdiction_id: str | None, evidence: str
+) -> None:
+    """Record a newly found endpoint and every jurisdiction it can be credited to.
+
+    The jurisdiction whose site linked it, the one its own URL names, and, for a lead
+    found inside a harvested catalog, the owners of that catalog (see attribution.py).
+    """
+    store.upsert_endpoint(ep, via=via, found_on=evidence)
+    if jurisdiction_id:
+        store.link_jurisdiction(ep, jurisdiction_id, evidence)
+    store.attribute(ep)
+    if via.startswith("harvest:"):
+        store.inherit(ep, via.removeprefix("harvest:"), evidence)
+
+
 def ingest_candidates(store: Store, candidates: Iterable[Candidate]) -> tuple[int, int]:
     """Save candidates; any the classifier recognises become endpoints straight away.
 
@@ -39,9 +55,10 @@ def ingest_candidates(store: Store, candidates: Iterable[Candidate]) -> tuple[in
         ep = classify(cand.url, cand.link_text)
         if ep is None:
             continue
-        store.upsert_endpoint(ep, via=cand.via, found_on=cand.found_on or cand.url)
-        if cand.jurisdiction_id:
-            store.link_jurisdiction(ep, cand.jurisdiction_id, cand.found_on or cand.url)
+        attach(
+            store, ep, via=cand.via, jurisdiction_id=cand.jurisdiction_id,
+            evidence=cand.found_on or cand.url,
+        )  # fmt: skip
         store.set_candidate_status(cand.url, "classified", ep.id)
         classified += 1
     store.commit()
@@ -99,9 +116,9 @@ async def run_probe(store: Store, fetcher: Fetcher, *, limit=None, concurrency=8
         if result is None:
             continue
         for ep in result.endpoints:
-            store.upsert_endpoint(ep, via="probe", found_on=row["url"])
-            if row["jurisdiction_id"]:
-                store.link_jurisdiction(ep, row["jurisdiction_id"], row["url"])
+            # A lead from a harvested catalog keeps its harvest:<id> origin for inheritance.
+            via = row["via"] if row["via"].startswith("harvest:") else "probe"
+            attach(store, ep, via=via, jurisdiction_id=row["jurisdiction_id"], evidence=row["url"])
         first = result.endpoints[0].id if result.endpoints else None
         store.set_candidate_status(row["url"], result.status, first)
         store.commit()
@@ -174,6 +191,7 @@ async def _harvest(
     counts = store.apply_assets(
         endpoint.id, harvest_id, assets, complete=status == "ok", observed_at=finished_at
     )
+    store.attribute(endpoint)  # a portal's title is only known once it's harvested
     ingest_candidates(store, found)
     store.finish_harvest(
         harvest_id, endpoint.id, status=status, counts=counts, n_assets=len(assets),
