@@ -130,9 +130,10 @@ that harvest is partial and can't mark assets removed.
 ## Politeness
 
 - One request at a time per host, then a pause of 1.5 × the last response time
-  (minimum 0.25 s). The 1.5× rule is the Munger's `time.sleep(elapsed * 1.5)`.
-- Retries on 408/429/5xx and timeouts, honouring `Retry-After`. These are govsearch's
-  retry codes.
+  (minimum 0.25 s, maximum 10 s). The 1.5× rule is the Munger's
+  `time.sleep(elapsed * 1.5)`. The cap stops a 30 s timeout turning into a 45 s wait.
+- Retries on 408/429/5xx (twice) and timeouts (once), with exponential backoff and
+  honouring `Retry-After`. These are govsearch's retry codes.
 - The crawler obeys robots.txt (RFC 9309: a 4xx robots.txt means no rules, a 5xx
   means stay out). Harvesters call documented public catalog APIs and don't consult
   robots.txt.
