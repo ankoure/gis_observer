@@ -15,8 +15,9 @@ import json
 import sqlite3
 from collections.abc import Iterable
 from pathlib import Path
-from urllib.parse import urlsplit
 
+from . import attribution
+from .attribution import OWNED, RANK, Matcher, bare_host
 from .models import Asset, Candidate, Endpoint, Jurisdiction, Platform
 from .util import utcnow
 
@@ -59,7 +60,7 @@ CREATE TABLE IF NOT EXISTS endpoints (
 CREATE TABLE IF NOT EXISTS endpoint_jurisdictions (
     endpoint_id TEXT NOT NULL,
     jurisdiction_id TEXT NOT NULL,
-    relation TEXT NOT NULL,               -- same_domain | linked
+    relation TEXT NOT NULL,               -- same_domain | named | via_endpoint | linked
     evidence_url TEXT,
     PRIMARY KEY (endpoint_id, jurisdiction_id)
 );
@@ -151,9 +152,8 @@ ASSET_COLUMNS = (
 )
 
 
-def _bare_host(url: str | None) -> str:
-    host = (urlsplit(url or "").hostname or "").lower()
-    return host[4:] if host.startswith("www.") else host
+# Keep the strongest relation when one jurisdiction reaches an endpoint several ways.
+_RANK_SQL = "CASE {} " + " ".join(f"WHEN '{r}' THEN {n}" for r, n in RANK.items()) + " ELSE 0 END"
 
 
 def _filters(ids, platforms, kinds) -> tuple[str, list]:
@@ -174,6 +174,7 @@ class Store:
         self.db = sqlite3.connect(str(path))
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
+        self._matcher: Matcher | None = None
         self.db.executescript(SCHEMA)
         self._migrate()
         self.db.commit()
@@ -252,6 +253,7 @@ class Store:
             [(j.id, j.name, j.website, j.kind, j.state, j.source) for j in rows],
         )
         self.db.commit()
+        self._matcher = None
         return cur.rowcount
 
     def jurisdictions_to_crawl(
@@ -315,23 +317,145 @@ class Store:
         return ep.id
 
     def link_jurisdiction(
-        self, endpoint: Endpoint, jurisdiction_id: str, evidence: str | None
-    ) -> None:
-        """Record that a jurisdiction points at this endpoint.
+        self, endpoint: Endpoint, jurisdiction_id: str, evidence: str | None,
+        relation: str | None = None,
+    ) -> None:  # fmt: skip
+        """Record that a jurisdiction points at, or owns, this endpoint.
 
-        `same_domain` when the endpoint sits on the jurisdiction's own domain (likely
-        theirs); `linked` otherwise. Fifty towns linking to MassGIS doesn't make it theirs.
+        Without a `relation`: `same_domain` when the endpoint sits on the jurisdiction's
+        own domain (likely theirs), `linked` otherwise. Fifty towns linking to MassGIS
+        doesn't make it theirs. A stronger relation replaces a weaker one (see
+        `attribution.RANK`).
         """
-        row = self.db.execute(
-            "SELECT website FROM jurisdictions WHERE id = ?", (jurisdiction_id,)
-        ).fetchone()
-        site, host = _bare_host(row["website"] if row else None), _bare_host(endpoint.url)
-        same = bool(site) and (host == site or host.endswith("." + site))
+        if relation is None:
+            row = self.db.execute(
+                "SELECT website FROM jurisdictions WHERE id = ?", (jurisdiction_id,)
+            ).fetchone()
+            site, host = bare_host(row["website"] if row else None), bare_host(endpoint.url)
+            same = bool(site) and (host == site or host.endswith("." + site))
+            relation = "same_domain" if same else "linked"
+        new_rank = _RANK_SQL.format("excluded.relation")
+        old_rank = _RANK_SQL.format("endpoint_jurisdictions.relation")
         self.db.execute(
-            """INSERT INTO endpoint_jurisdictions (endpoint_id, jurisdiction_id, relation, evidence_url)
-               VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING""",
-            (endpoint.id, jurisdiction_id, "same_domain" if same else "linked", evidence),
+            f"""INSERT INTO endpoint_jurisdictions (endpoint_id, jurisdiction_id, relation, evidence_url)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(endpoint_id, jurisdiction_id) DO UPDATE SET
+                 relation = excluded.relation, evidence_url = excluded.evidence_url
+               WHERE {new_rank} > {old_rank}""",
+            (endpoint.id, jurisdiction_id, relation, evidence),
         )
+
+    def _jurisdiction_matcher(self) -> Matcher:
+        if self._matcher is None:
+            self._matcher = Matcher(
+                self.db.execute("SELECT id, name, website, state FROM jurisdictions")
+            )
+        return self._matcher
+
+    def _portal(self, endpoint_id: str) -> tuple[str | None, str | None]:
+        """A harvested portal's (title, org id), from its `portal` asset."""
+        row = self.db.execute(
+            """SELECT title, json_extract(extra, '$.org_id') AS org FROM assets
+               WHERE endpoint_id = ? AND kind = 'portal' AND removed_at IS NULL LIMIT 1""",
+            (endpoint_id,),
+        ).fetchone()
+        return (row["title"], row["org"]) if row else (None, None)
+
+    def attribute(self, endpoint: Endpoint) -> list[str]:
+        """Link an endpoint to the jurisdiction its own URL or portal title names.
+
+        `same_domain` when it sits on a jurisdiction's website domain, `named` when a
+        viewer slug, portal urlKey, Hub site name or portal title names exactly one
+        jurisdiction. Shared catalogs are never attributed. Returns the jurisdictions.
+        """
+        if attribution.is_shared(endpoint.url):
+            return []
+        m = self._jurisdiction_matcher()
+        found = []
+        if jid := m.by_host(endpoint.url):
+            self.link_jurisdiction(endpoint, jid, endpoint.url, "same_domain")
+            found.append(jid)
+        names = attribution.slugs(endpoint)
+        if endpoint.platform is Platform.ARCGIS_PORTAL:
+            title, _ = self._portal(endpoint.id)
+            if title:
+                names.append((attribution.title_slug(title), True))
+        for slug, bare_ok in names:
+            if (jid := m.by_slug(slug, bare_ok)) and jid not in found:
+                self.link_jurisdiction(endpoint, jid, endpoint.url, "named")
+                found.append(jid)
+        return found
+
+    def inherit(self, endpoint: Endpoint, parent_id: str, evidence: str | None) -> list[str]:
+        """Credit a lead to the jurisdictions that own the catalog it was found in.
+
+        Only `same_domain` and `named` parents pass anything on, never a shared
+        catalog, and only where `attribution.may_inherit` allows. Leads that already
+        belong to some other jurisdiction keep that owner alone. Returns the
+        jurisdictions linked as `via_endpoint`.
+        """
+        if endpoint.id == parent_id:
+            return []
+        parent = self.db.execute("SELECT url FROM endpoints WHERE id = ?", (parent_id,)).fetchone()
+        if parent is None or attribution.is_shared(parent["url"]):
+            return []
+        marks = ",".join("?" * len(OWNED))
+        owners = self.db.execute(
+            f"""SELECT ej.jurisdiction_id, j.website FROM endpoint_jurisdictions ej
+                LEFT JOIN jurisdictions j ON j.id = ej.jurisdiction_id
+                WHERE ej.endpoint_id = ? AND ej.relation IN ({marks})""",
+            (parent_id, *OWNED),
+        ).fetchall()
+        if not owners:
+            return []
+        owned_by = {
+            r["jurisdiction_id"]
+            for r in self.db.execute(
+                f"""SELECT jurisdiction_id FROM endpoint_jurisdictions
+                    WHERE endpoint_id = ? AND relation IN ({marks})""",
+                (endpoint.id, *OWNED),
+            )
+        }
+        heirs = {r["jurisdiction_id"] for r in owners}
+        if owned_by - heirs:
+            return []
+        _, org = self._portal(parent_id)
+        linked = []
+        for r in owners:
+            if attribution.may_inherit(endpoint, r["website"], org):
+                self.link_jurisdiction(endpoint, r["jurisdiction_id"], evidence, "via_endpoint")
+                linked.append(r["jurisdiction_id"])
+        return linked
+
+    def attribute_all(self) -> dict[str, int]:
+        """Re-run attribution over the whole catalog: content first, then parents.
+
+        For catalogs built before attribution existed, or after loading new
+        jurisdictions. Safe to repeat: links are only ever added or strengthened.
+        """
+        before = self._relation_counts()
+        for ep in self.endpoints():
+            self.attribute(ep)
+        leads = self.db.execute(
+            """SELECT c.via, c.found_on, c.url, e.platform, e.url AS endpoint_url, e.vendor,
+                      e.label
+               FROM candidates c JOIN endpoints e ON e.id = c.endpoint_id
+               WHERE c.via LIKE 'harvest:%'"""
+        ).fetchall()
+        for r in leads:
+            ep = Endpoint(Platform(r["platform"]), r["endpoint_url"], r["vendor"], r["label"])
+            self.inherit(ep, r["via"].removeprefix("harvest:"), r["found_on"] or r["url"])
+        self.db.commit()
+        after = self._relation_counts()
+        return {rel: after.get(rel, 0) - before.get(rel, 0) for rel in RANK}
+
+    def _relation_counts(self) -> dict[str, int]:
+        return {
+            r[0]: r[1]
+            for r in self.db.execute(
+                "SELECT relation, COUNT(*) FROM endpoint_jurisdictions GROUP BY 1"
+            )
+        }
 
     def endpoints(
         self,
@@ -509,13 +633,13 @@ class Store:
     def coverage(self) -> list[sqlite3.Row]:
         """Per state, how many jurisdictions fall in each discovery outcome.
 
-        Each jurisdiction counts once, in the first group that fits: an endpoint on its
-        own domain, only links to endpoints elsewhere, crawl failed, crawled and
+        Each jurisdiction counts once, in the first group that fits: an endpoint of its
+        own (on its domain, named for it, or found in its own catalog), only links to endpoints elsewhere, crawl failed, crawled and
         nothing found, not crawled yet.
         """
         return self.db.execute(
             """WITH found AS (
-                 SELECT jurisdiction_id, MAX(relation = 'same_domain') AS own
+                 SELECT jurisdiction_id, MAX(relation != 'linked') AS own
                  FROM endpoint_jurisdictions GROUP BY 1)
                SELECT j.state, COUNT(*) AS total,
                  SUM(COALESCE(f.own = 1, 0)) AS own_domain,

@@ -59,10 +59,25 @@ A new platform is one module in `harvesters/` subclassing `Harvester` with a
 - `candidates`: every URL found, where it was found, its status
   (`new` → `classified` | `found` | `none` | `dead`), and the endpoint it led to.
 - `endpoints`: catalog roots, keyed by `sha1(platform|url)`, with how they were found.
-- `endpoint_jurisdictions`: which jurisdictions point at which endpoints.
-  `same_domain` means the endpoint is on the jurisdiction's own domain and is probably
-  theirs. `linked` means they only link to it; fifty towns linking to MassGIS doesn't
-  make MassGIS theirs.
+- `endpoint_jurisdictions`: which jurisdictions point at or own which endpoints,
+  one row per pair with the strongest `relation` found:
+  - `same_domain`: the endpoint is on the jurisdiction's own domain, so it's probably theirs.
+  - `named`: the endpoint's URL or portal names the jurisdiction and no other
+    (`axisgis.com/ChesterMA`, `westfieldma.maps.arcgis.com`, a portal titled "Town of
+    Wilbraham"). A bare name like `chester` only counts on vendors with one viewer per
+    town, and only if exactly one jurisdiction has that name.
+  - `via_endpoint`: found inside a catalog the jurisdiction owns (`same_domain` or
+    `named`), such as a hosted feature server listed in the town's own ArcGIS Online org.
+  - `linked`: the jurisdiction only links to it. Fifty towns linking to MassGIS
+    doesn't make MassGIS theirs.
+
+  Endpoints found inside other catalogs are attributed by `attribution.py`. Shared
+  catalogs (state agencies, regional planners, consultants: `SHARED_HOSTS`) point at
+  many towns. They're never attributed or inherited from, so Wilbraham linking to
+  MassGIS doesn't credit it with MassGIS's 1,243 assets. A lead isn't inherited if
+  it's on another government's domain (`.gov`, `.us`), belongs to a different ArcGIS
+  Online org than the portal that listed it, or is already owned by another
+  jurisdiction. `gis-observer attribute` re-runs all of this over an existing catalog.
 - `harvests`: one row per run per endpoint: status, counts, errors, raw file path.
 - `assets`: current state, keyed by `(endpoint_id, key)`, where `key` is usually the URL.
 - `asset_versions`: a row only when an asset is `new`, `changed`, `removed` or
@@ -79,7 +94,8 @@ A new platform is one module in `harvesters/` subclassing `Harvester` with a
   WHERE state = 'MA' AND lower(name) LIKE '%parcel%';
   ```
 
-`report` puts each jurisdiction in one coverage group: an endpoint on its own domain,
+`report` puts each jurisdiction in one coverage group: an endpoint of its own (any
+relation but `linked`),
 only links to endpoints elsewhere, crawl failed, nothing found, or not crawled yet.
 Towns crawled before crawl outcomes were recorded count as "nothing found" until
 `crawl --recrawl`.

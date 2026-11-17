@@ -59,4 +59,6 @@ class Harvester(ABC):
         return data
 
     def candidate(self, endpoint: Endpoint, url: str, found_on=None, text=None) -> Candidate:
+        """A lead found in this catalog. It has no jurisdiction of its own: the pipeline
+        credits it from its URL and from this endpoint's owners (see attribution.py)."""
         return Candidate(url=url, via=f"harvest:{endpoint.id}", found_on=found_on, link_text=text)
