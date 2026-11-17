@@ -112,6 +112,7 @@ CREATE TABLE IF NOT EXISTS asset_versions (
     snapshot TEXT,
     PRIMARY KEY (endpoint_id, key, harvest_id)
 );
+CREATE INDEX IF NOT EXISTS asset_versions_observed ON asset_versions(observed_at);
 CREATE TABLE IF NOT EXISTS checks (
     endpoint_id TEXT NOT NULL,
     checked_at TEXT NOT NULL,
@@ -121,6 +122,7 @@ CREATE TABLE IF NOT EXISTS checks (
     tls_insecure INTEGER,
     detail TEXT
 );
+CREATE INDEX IF NOT EXISTS checks_endpoint ON checks(endpoint_id, checked_at);
 CREATE VIEW IF NOT EXISTS current_assets AS
     SELECT e.platform, e.url AS endpoint_url, e.vendor, a.*
     FROM assets a JOIN endpoints e ON e.id = a.endpoint_id
@@ -152,6 +154,17 @@ ASSET_COLUMNS = (
 def _bare_host(url: str | None) -> str:
     host = (urlsplit(url or "").hostname or "").lower()
     return host[4:] if host.startswith("www.") else host
+
+
+def _filters(ids, platforms, kinds) -> tuple[str, list]:
+    """`AND ...` clauses limiting rows to some endpoints (e), platforms or kinds (a)."""
+    clauses, params = [], []
+    for column, values in (("e.id", ids), ("e.platform", platforms), ("a.kind", kinds)):
+        if values:
+            values = [str(v) for v in values]
+            clauses.append(f"{column} IN ({','.join('?' * len(values))})")
+            params += values
+    return "".join(f" AND {c}" for c in clauses), params
 
 
 class Store:
@@ -513,6 +526,80 @@ class Store:
                  SUM(f.jurisdiction_id IS NULL AND j.last_crawled_at IS NULL) AS not_crawled
                FROM jurisdictions j LEFT JOIN found f ON f.jurisdiction_id = j.id
                GROUP BY 1 ORDER BY 2 DESC"""
+        ).fetchall()
+
+    def asset_changes(
+        self, since: str, *, ids=None, platforms=None, kinds=None
+    ) -> list[sqlite3.Row]:
+        """Asset versions observed since `since`, minus each endpoint's first harvest.
+
+        Each row carries the endpoint, the asset's kind and name (from the snapshot, or
+        the asset's last known state for removals), and `prev_snapshot`: the snapshot of
+        the version before it, so a `changed` row can be compared with what it replaced.
+        """
+        where, params = _filters(ids, platforms, kinds)
+        return self.db.execute(
+            f"""WITH firsts AS (
+                  SELECT endpoint_id, MIN(harvest_id) AS harvest_id
+                  FROM asset_versions GROUP BY 1)
+                SELECT v.endpoint_id, e.platform, e.url AS endpoint_url, v.harvest_id,
+                  v.observed_at, v.change, v.key, a.kind,
+                  COALESCE(json_extract(v.snapshot, '$.name'), a.name) AS name,
+                  v.snapshot,
+                  (SELECT p.snapshot FROM asset_versions p
+                   WHERE p.endpoint_id = v.endpoint_id AND p.key = v.key
+                     AND p.harvest_id < v.harvest_id AND p.snapshot IS NOT NULL
+                   ORDER BY p.harvest_id DESC LIMIT 1) AS prev_snapshot
+                FROM asset_versions v
+                JOIN endpoints e ON e.id = v.endpoint_id
+                JOIN assets a ON a.endpoint_id = v.endpoint_id AND a.key = v.key
+                JOIN firsts f ON f.endpoint_id = v.endpoint_id
+                WHERE v.observed_at >= ? AND v.harvest_id != f.harvest_id {where}
+                ORDER BY e.url, v.observed_at, v.change, a.kind, name""",
+            (since, *params),
+        ).fetchall()
+
+    def first_harvests(
+        self, since: str, *, ids=None, platforms=None, kinds=None
+    ) -> list[sqlite3.Row]:
+        """Endpoints first harvested since `since`, with how many assets that found."""
+        where, params = _filters(ids, platforms, kinds)
+        return self.db.execute(
+            f"""WITH firsts AS (
+                  SELECT endpoint_id, MIN(harvest_id) AS harvest_id
+                  FROM asset_versions GROUP BY 1)
+                SELECT v.endpoint_id, e.platform, e.url AS endpoint_url,
+                  MIN(v.observed_at) AS observed_at, COUNT(*) AS n
+                FROM firsts f
+                JOIN asset_versions v
+                  ON v.endpoint_id = f.endpoint_id AND v.harvest_id = f.harvest_id
+                JOIN endpoints e ON e.id = v.endpoint_id
+                JOIN assets a ON a.endpoint_id = v.endpoint_id AND a.key = v.key
+                WHERE v.observed_at >= ? {where}
+                GROUP BY 1, 2, 3 ORDER BY e.url""",
+            (since, *params),
+        ).fetchall()
+
+    def checks_since(self, since: str, *, ids=None, platforms=None) -> list[sqlite3.Row]:
+        """Every check since `since`, oldest first within each endpoint.
+
+        `last_up_at` is the endpoint's latest successful check at any time, and
+        `down_since` its first failed check after that one (NULL while it's up).
+        """
+        where, params = _filters(ids, platforms, None)
+        return self.db.execute(
+            f"""WITH last_up AS (
+                  SELECT endpoint_id, MAX(checked_at) AS at FROM checks WHERE ok = 1 GROUP BY 1)
+                SELECT c.*, e.platform, e.url AS endpoint_url, u.at AS last_up_at,
+                  (SELECT MIN(d.checked_at) FROM checks d
+                   WHERE d.endpoint_id = c.endpoint_id AND d.ok = 0
+                     AND d.checked_at > COALESCE(u.at, '')) AS down_since
+                FROM checks c
+                JOIN endpoints e ON e.id = c.endpoint_id
+                LEFT JOIN last_up u ON u.endpoint_id = c.endpoint_id
+                WHERE c.checked_at >= ? {where}
+                ORDER BY e.url, c.endpoint_id, c.checked_at""",
+            (since, *params),
         ).fetchall()
 
     def query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
