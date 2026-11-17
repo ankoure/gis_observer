@@ -86,6 +86,46 @@ def test_crawl_skips_document_links_and_weak_leftovers():
     assert [c.url for c in asyncio.run(go()).candidates] == ["https://www.town.gov/gis"]
 
 
+def test_untitled_iframe_label_has_no_gis_word():
+    links = extract_links(
+        '<iframe src="https://boxcast.tv/view-embed/x"></iframe>', "https://t.gov"
+    )
+    assert links == [("https://boxcast.tv/view-embed/x", "[iframe]")]
+
+
+def test_crawl_drops_directions_documents_and_untitled_iframes():
+    """What the first live run (2026-11-16) wrongly kept, next to what it should keep."""
+    site = {
+        "https://www.town.gov": (
+            # directions links
+            '<a href="https://maps.live.com/default.aspx?where1=1+Main+St">Bing</a>'
+            '<a href="http://maps.yahoo.com/maps_result?addr=1+Main+St">Directions</a>'
+            # off-site documents with "map" in their text
+            '<a href="https://county.gov/files/Zoning-Map.pdf">Zoning Map</a>'
+            '<a href="https://trails.org/img/trail-map.png">Trail map</a>'
+            '<a href="https://county.gov/docs/map.docx">Map</a>'
+            # untitled iframes that aren't maps
+            '<iframe src="https://boxcast.tv/view-embed/abc"></iframe>'
+            '<iframe src="https://view.officeapps.live.com/op/embed.aspx?src=x"></iframe>'
+            # still kept
+            '<a href="https://county.gov/gis">County GIS</a>'
+            '<a href="https://county.gov/data/roads.geojson">Roads map</a>'
+            '<iframe src="https://town.maps.arcgis.com/apps/instant/x/index.html"></iframe>'
+        ),
+    }
+    town = Jurisdiction("osm:relation/3", "Town", "https://www.town.gov")
+
+    async def go():
+        async with make_fetcher(site) as http:
+            return await crawl_site(http, town, max_pages=1)
+
+    assert {c.url for c in asyncio.run(go()).candidates} == {
+        "https://county.gov/gis",
+        "https://county.gov/data/roads.geojson",
+        "https://town.maps.arcgis.com/apps/instant/x/index.html",
+    }
+
+
 def test_probe_scans_a_maps_page():
     page = (
         "<a href='https://county.gov/arcgis/rest/services/Parcels/MapServer'>Parcels</a>"

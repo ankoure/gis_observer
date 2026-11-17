@@ -43,8 +43,10 @@ VIEWER_HOSTS = {
 PATH_SCOPED_VIEWERS = {"axisgis.com", "hosting.tighebond.com", "mapsonline.net", "vgsi.com"}
 
 # Consumer map and social sites a town links to for directions or news; never a data source.
+# live.com covers old Bing Maps links (maps.live.com) and the Office document viewer.
 NOT_GIS = (
-    "google.com", "goo.gl", "bing.com", "apple.com", "mapquest.com", "openstreetmap.org",
+    "google.com", "goo.gl", "bing.com", "live.com", "yahoo.com", "apple.com", "mapquest.com",
+    "openstreetmap.org",
     "waze.com", "yelp.com", "facebook.com", "twitter.com", "x.com", "youtube.com",
     "instagram.com", "linkedin.com",
 )  # fmt: skip

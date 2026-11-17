@@ -37,6 +37,8 @@ def extract_links(html: str, page_url: str) -> list[tuple[str, str]]:
     for tag in soup.find_all(["a", "area"], href=True):
         text = tag.get_text(" ", strip=True) or tag.get("title") or tag.get("aria-label") or ""
         add(tag["href"], text)
+    # A neutral label: "map" here would make every untitled iframe (video players,
+    # document viewers) look like GIS. Real embedded maps are recognised by their URL.
     for tag in soup.find_all(["iframe", "embed"]):
-        add(tag.get("src") or tag.get("data-src"), tag.get("title") or "[embedded map]")
+        add(tag.get("src") or tag.get("data-src"), tag.get("title") or "[iframe]")
     return out

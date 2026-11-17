@@ -112,9 +112,16 @@ async def crawl_site(
         for link, text in extract_links(resp.text, resp.url):
             on_site = _bare(urlsplit(link).hostname) in site_hosts
             gis_word = has_gis_keyword(link, text)
+            # Geo files (.kml, .geojson, a shapefile .zip) are caught by classify(); any
+            # other document with "map" in its text (zoning PDF, trail map image) isn't GIS.
             if link not in found and (
                 classify(link, text) is not None
-                or (gis_word and not on_site and is_gis_candidate(link, text))
+                or (
+                    gis_word
+                    and not on_site
+                    and _followable(link, text)
+                    and is_gis_candidate(link, text)
+                )
             ):
                 found[link] = Candidate(
                     url=link,
