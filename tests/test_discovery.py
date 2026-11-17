@@ -111,6 +111,26 @@ def test_probe_scans_a_maps_page():
     }
 
 
+def test_probe_recognises_a_hub_site_on_a_custom_domain():
+    page = '<html><head><link rel="stylesheet" href="/opendata-ui/assets/app.css"></head></html>'
+    routes = {
+        "https://gis.town.gov": page,
+        "https://hub.arcgis.com/api/v3/domains/gis.town.gov": {"orgId": "ORG1", "orgKey": "town"},
+        "https://www.arcgis.com/sharing/rest/portals/ORG1": {"urlKey": "Town"},
+    }
+
+    async def go():
+        async with make_fetcher(routes) as http:
+            return await probe(http, "https://gis.town.gov")
+
+    result = asyncio.run(go())
+    assert result.status == "found"
+    assert {(e.platform, e.url) for e in result.endpoints} == {
+        (Platform.DCAT, "https://gis.town.gov/api/feed/dcat-us/1.1.json"),
+        (Platform.ARCGIS_PORTAL, "https://town.maps.arcgis.com"),
+    }
+
+
 def test_probe_dead_link():
     async def go():
         async with make_fetcher({}) as http:
