@@ -178,3 +178,23 @@ def test_canonical():
 )
 def test_geo_format(fmt, url, media, expected):
     assert geo_format(fmt, url, media) == expected
+
+
+@pytest.mark.parametrize(
+    "urls",
+    [
+        ["http://gis.vgsi.com/longmeadowma", "https://gis.vgsi.com/LongmeadowMA/Search.aspx"],
+        ["https://www.axisgis.com/hampdenma", "https://next.axisgis.com/HampdenMA/"],
+        ["https://www.axisgis.com/SouthwickMA", "https://next.axisgis.com/SouthwickMA"],
+        ["http://amherstma.mapgeo.io", "https://AmherstMA.mapgeo.io/datasets/properties"],
+    ],
+)
+def test_one_towns_viewer_is_one_endpoint(urls):
+    assert len({classify(u).id for u in urls}) == 1
+
+
+def test_viewers_of_different_towns_stay_apart():
+    a = classify("https://www.axisgis.com/HampdenMA")
+    b = classify("https://www.axisgis.com/SouthwickMA")
+    c = classify("https://southwickma.mapgeo.io")
+    assert len({a.id, b.id, c.id}) == 3

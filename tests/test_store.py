@@ -23,7 +23,8 @@ def test_change_tracking():
     assert _apply(store, [a, b]) == {"new": 0, "changed": 0, "removed": 0, "returned": 0}
 
     a2 = Asset(key="a", kind="layer", name="Parcels", description="now with owners")
-    assert _apply(store, [a2]) == {"new": 0, "changed": 1, "removed": 1, "returned": 0}
+    assert _apply(store, [a2]) == {"new": 0, "changed": 1, "removed": 0, "returned": 0}
+    assert _apply(store, [a2]) == {"new": 0, "changed": 0, "removed": 1, "returned": 0}
     assert _apply(store, [a2, b]) == {"new": 0, "changed": 0, "removed": 0, "returned": 1}
 
     history = store.query("SELECT key, change FROM asset_versions ORDER BY harvest_id, key")
@@ -32,6 +33,47 @@ def test_change_tracking():
     ]  # fmt: skip
     live = store.query("SELECT key FROM current_assets ORDER BY key")
     assert [r["key"] for r in live] == ["a", "b"]
+
+
+def _missed(store):
+    return {r["key"]: r["missed_at"] for r in store.query("SELECT key, missed_at FROM assets")}
+
+
+def test_one_complete_miss_is_not_a_removal():
+    store = Store(":memory:")
+    store.upsert_endpoint(EP)
+    a, b = Asset(key="a", kind="layer"), Asset(key="b", kind="layer")
+    _apply(store, [a, b])
+    # An out-of-sync node leaves b out once, then it's back: no history either way.
+    assert _apply(store, [a])["removed"] == 0
+    assert _missed(store)["b"] is not None
+    assert _apply(store, [a, b]) == {"new": 0, "changed": 0, "removed": 0, "returned": 0}
+    assert _missed(store) == {"a": None, "b": None}
+    assert [r["change"] for r in store.query("SELECT change FROM asset_versions")] == ["new"] * 2
+    assert store.query("SELECT COUNT(*) FROM current_assets")[0][0] == 2
+
+    # A fresh miss after the miss was cleared starts counting again.
+    assert _apply(store, [a])["removed"] == 0
+    assert _apply(store, [a])["removed"] == 1
+    assert _missed(store) == {"a": None, "b": None}
+    gone = store.query("SELECT key FROM assets WHERE removed_at IS NOT NULL")
+    assert [r["key"] for r in gone] == ["b"]
+
+
+def test_partial_harvest_leaves_misses_alone():
+    store = Store(":memory:")
+    store.upsert_endpoint(EP)
+    a, b, c = (Asset(key=k, kind="layer") for k in "abc")
+    _apply(store, [a, b, c])
+    _apply(store, [a, b])  # c missed once
+    # A partial harvest neither records b's miss nor clears c's.
+    assert _apply(store, [a, c], complete=False)["removed"] == 0
+    assert _missed(store)["b"] is None and _missed(store)["c"] is not None
+    # So the next complete miss removes c but only records b's first miss.
+    assert _apply(store, [a])["removed"] == 1
+    assert _missed(store)["b"] is not None
+    gone = store.query("SELECT key FROM assets WHERE removed_at IS NOT NULL")
+    assert [r["key"] for r in gone] == ["c"]
 
 
 def test_partial_harvest_never_removes():
@@ -148,3 +190,41 @@ def test_jurisdiction_assets_and_coverage():
         {"state": "MA", "total": 5, "own_domain": 1, "linked_only": 1, "crawl_failed": 1,
          "nothing_found": 1, "not_crawled": 1},
     ]  # fmt: skip
+
+
+def test_old_viewer_ids_are_merged(tmp_path):
+    from gis_observer.models import stable_id
+
+    path = tmp_path / "old.sqlite"
+    store = Store(path)
+    store.upsert_jurisdictions([Jurisdiction("osm:1", "Hampden", "https://hampden.gov")])
+    # As stored before viewer ids folded scheme, host alias and slug case.
+    old = [
+        ("https://www.axisgis.com/hampdenma", "2024-01-02"),
+        ("https://next.axisgis.com/HampdenMA", "2024-01-01"),
+    ]
+    for url, seen in old:
+        oid = stable_id(Platform.VIEWER, url)
+        store.db.execute(
+            """INSERT INTO endpoints (id, platform, url, vendor, first_seen)
+               VALUES (?, 'viewer', ?, 'AxisGIS', ?)""",
+            (oid, url, seen),
+        )
+        store.db.execute(
+            """INSERT INTO endpoint_jurisdictions VALUES (?, 'osm:1', 'linked', ?)""",
+            (oid, f"https://hampden.gov/maps?{seen}"),
+        )
+        store.db.execute(
+            "INSERT INTO candidates (url, via, first_seen, endpoint_id) VALUES (?, 'crawl', ?, ?)",
+            (url, seen, oid),
+        )
+    store.close()
+
+    store = Store(path)
+    ep = Endpoint(Platform.VIEWER, "https://www.axisgis.com/HampdenMA", vendor="AxisGIS")
+    eps = store.query("SELECT id, url, first_seen FROM endpoints")
+    assert [tuple(r) for r in eps] == [(ep.id, "https://next.axisgis.com/HampdenMA", "2024-01-01")]
+    links = store.query("SELECT endpoint_id, jurisdiction_id FROM endpoint_jurisdictions")
+    assert [tuple(r) for r in links] == [(ep.id, "osm:1")]
+    cands = store.query("SELECT DISTINCT endpoint_id FROM candidates")
+    assert [r[0] for r in cands] == [ep.id]
