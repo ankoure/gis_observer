@@ -95,3 +95,56 @@ def test_harvest_one_end_to_end(tmp_path):
     harvest = store.query("SELECT status, n_assets, n_new, raw_path FROM harvests")[0]
     assert (harvest["status"], harvest["n_assets"], harvest["n_new"]) == ("ok", 2, 2)
     assert harvest["raw_path"].endswith(".jsonl.gz")
+
+
+def test_old_database_gains_crawl_columns(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.sqlite"
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE jurisdictions (id TEXT PRIMARY KEY, name TEXT NOT NULL, "
+               "website TEXT, kind TEXT, state TEXT, source TEXT, last_crawled_at TEXT)")  # fmt: skip
+    db.execute("INSERT INTO jurisdictions (id, name) VALUES ('osm:1', 'Town')")
+    db.commit()
+    db.close()
+    store = Store(path)
+    store.mark_crawled("osm:1", pages=0, failure="blocked")
+    row = store.query("SELECT crawl_pages, crawl_failure FROM jurisdictions")[0]
+    assert tuple(row) == (0, "blocked")
+
+
+def test_jurisdiction_assets_and_coverage():
+    store = Store(":memory:")
+    store.upsert_jurisdictions(
+        [
+            Jurisdiction("osm:1", "Own", "https://town.gov", "Municipality", "MA"),
+            Jurisdiction("osm:2", "Linker", "https://linker.gov", "Municipality", "MA"),
+            Jurisdiction("osm:3", "Empty", "https://empty.gov", "Municipality", "MA"),
+            Jurisdiction("osm:4", "Blocked", "https://blocked.gov", "Municipality", "MA"),
+            Jurisdiction("osm:5", "Later", "https://later.gov", "Municipality", "MA"),
+        ]
+    )
+    # Reloading without state or kind keeps what was there.
+    store.upsert_jurisdictions([Jurisdiction("osm:5", "Later", "https://later.gov")])
+    store.upsert_endpoint(EP)
+    store.link_jurisdiction(EP, "osm:1", "https://town.gov/gis")
+    store.link_jurisdiction(EP, "osm:2", "https://linker.gov/maps")
+    for jid in ("osm:1", "osm:2", "osm:3"):
+        store.mark_crawled(jid, pages=5)
+    store.mark_crawled("osm:4", pages=0, failure="blocked")
+    _apply(store, [Asset(key="p", kind="layer", name="Parcels", format="esri-feature")])
+
+    rows = store.query(
+        """SELECT jurisdiction_name, relation, platform, endpoint_url, name, format
+           FROM jurisdiction_assets WHERE state = 'MA' AND lower(name) LIKE '%parcel%'
+           ORDER BY jurisdiction_name"""
+    )
+    assert [tuple(r) for r in rows] == [
+        ("Linker", "linked", "arcgis_rest", EP.url, "Parcels", "esri-feature"),
+        ("Own", "same_domain", "arcgis_rest", EP.url, "Parcels", "esri-feature"),
+    ]
+    cov = store.coverage()
+    assert [dict(r) for r in cov] == [
+        {"state": "MA", "total": 5, "own_domain": 1, "linked_only": 1, "crawl_failed": 1,
+         "nothing_found": 1, "not_crawled": 1},
+    ]  # fmt: skip

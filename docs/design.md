@@ -53,7 +53,9 @@ A new platform is one module in `harvesters/` subclassing `Harvester` with a
 
 ## Data model (SQLite, `store.py`)
 
-- `jurisdictions`: who we look at.
+- `jurisdictions`: who we look at. `crawl_pages` and `crawl_failure` record the last
+  crawl's outcome: pages fetched, and when there were none, why (`blocked` for a 403
+  or a Cloudflare challenge, `dead`, `robots`, `http_<status>`, `not_html`, `error`).
 - `candidates`: every URL found, where it was found, its status
   (`new` → `classified` | `found` | `none` | `dead`), and the endpoint it led to.
 - `endpoints`: catalog roots, keyed by `sha1(platform|url)`, with how they were found.
@@ -68,6 +70,19 @@ A new platform is one module in `harvesters/` subclassing `Harvester` with a
 - `checks`: up/down history (ported from the Munger's `server_check.py` /
   `health_check.py`).
 - `current_assets` (view): live assets joined to their endpoint.
+- `jurisdiction_assets` (view): `current_assets` for each jurisdiction that points at
+  the endpoint, with the `relation`. For example:
+
+  ```sql
+  SELECT jurisdiction_name, relation, platform, endpoint_url, name, format
+  FROM jurisdiction_assets
+  WHERE state = 'MA' AND lower(name) LIKE '%parcel%';
+  ```
+
+`report` puts each jurisdiction in one coverage group: an endpoint on its own domain,
+only links to endpoints elsewhere, crawl failed, nothing found, or not crawled yet.
+Towns crawled before crawl outcomes were recorded count as "nothing found" until
+`crawl --recrawl`.
 
 **Change rules.** An asset changes when its normalised record's hash changes. That
 includes edits to name, description, fields, extent, or the source's last-edit date.

@@ -22,7 +22,7 @@ See [docs/design.md](docs/design.md) for how the pieces fit and what each table 
 uv sync
 
 # Who to look at, and servers already known
-uv run gis-observer seeds osm data/seeds/ma_municipalities.csv            # 349 MA towns (govsearch)
+uv run gis-observer seeds osm data/seeds/ma_municipalities.csv --state MA --kind Municipality  # 349 MA towns (govsearch)
 uv run gis-observer seeds arcgis-servers data/seeds/arcgis_servers_2024.csv  # 518 servers (Munger)
 
 # Find GIS links on town websites, and identify the ones the classifier can't
