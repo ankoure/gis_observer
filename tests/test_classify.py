@@ -68,6 +68,27 @@ CASES = [
         Platform.VIEWER,
         "https://gis.vgsi.com/longmeadowma",
     ),
+    # Tighe & Bond: one viewer per first path segment
+    (
+        "http://hosting.tighebond.com/palmerma_Public/",
+        Platform.VIEWER,
+        "http://hosting.tighebond.com/palmerma_Public",
+    ),
+    (
+        "http://hosting.tighebond.com/chicopeema_public/",
+        Platform.VIEWER,
+        "http://hosting.tighebond.com/chicopeema_public",
+    ),
+    (
+        "http://hosting.tighebond.com/AgawamMA_public/",
+        Platform.VIEWER,
+        "http://hosting.tighebond.com/AgawamMA_public",
+    ),
+    (
+        "http://hosting.tighebond.com/wilbraham/main.htm",
+        Platform.VIEWER,
+        "http://hosting.tighebond.com/wilbraham",
+    ),
     # Files
     (
         "https://gis.cambridgema.gov/download/gdb/TRAFFIC_Signals.gdb.zip",
