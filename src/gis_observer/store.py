@@ -14,7 +14,8 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from . import attribution
@@ -79,6 +80,7 @@ CREATE TABLE IF NOT EXISTS harvests (
     errors TEXT,
     raw_path TEXT
 );
+CREATE INDEX IF NOT EXISTS harvests_endpoint ON harvests(endpoint_id, status);
 CREATE TABLE IF NOT EXISTS assets (
     endpoint_id TEXT NOT NULL,
     key TEXT NOT NULL,
@@ -136,6 +138,17 @@ CREATE VIEW IF NOT EXISTS jurisdiction_assets AS
     FROM jurisdictions j
     JOIN endpoint_jurisdictions ej ON ej.jurisdiction_id = j.id
     JOIN current_assets ca ON ca.endpoint_id = ej.endpoint_id;
+-- Failed harvests since the endpoint last answered (an ok or partial harvest).
+CREATE VIEW IF NOT EXISTS endpoint_failures AS
+    SELECT h.endpoint_id,
+           COUNT(*) AS consecutive_failures,
+           MAX(h.finished_at) AS last_failed_at
+    FROM harvests h
+    WHERE h.status = 'failed'
+      AND h.id > COALESCE((SELECT MAX(s.id) FROM harvests s
+                           WHERE s.endpoint_id = h.endpoint_id
+                             AND s.status IN ('ok', 'partial')), 0)
+    GROUP BY h.endpoint_id;
 """
 
 # Columns added after a table was first created: (table, column, type).
@@ -166,6 +179,32 @@ def _filters(ids, platforms, kinds) -> tuple[str, list]:
             clauses.append(f"{column} IN ({','.join('?' * len(values))})")
             params += values
     return "".join(f" AND {c}" for c in clauses), params
+
+
+@dataclass(frozen=True)
+class FailurePolicy:
+    """When to stop harvesting an endpoint that keeps failing, and when to try again.
+
+    An endpoint is skipped once its last `max_failures` harvests in a row failed. It
+    comes back when `retry_after_days` have passed since the last failure, or when a
+    `check` succeeds after it.
+    """
+
+    max_failures: int = 3
+    retry_after_days: float = 30
+
+    def retry_cutoff(self) -> str:
+        when = datetime.now(UTC) - timedelta(days=self.retry_after_days)
+        return when.isoformat(timespec="seconds")
+
+
+# Endpoint ids currently skipped under a policy; parameters: (max_failures, retry_cutoff).
+_FAILING_IDS = """
+    SELECT f.endpoint_id FROM endpoint_failures f
+    WHERE f.consecutive_failures >= ? AND f.last_failed_at >= ?
+      AND NOT EXISTS (SELECT 1 FROM checks c WHERE c.endpoint_id = f.endpoint_id
+                      AND c.ok AND c.checked_at > f.last_failed_at)
+"""
 
 
 class Store:
@@ -269,13 +308,13 @@ class Store:
         for row in self.db.execute(
             "SELECT id, website FROM jurisdictions WHERE website IS NOT NULL"
         ):
-            site = _bare_host(row["website"])
+            site = bare_host(row["website"])
             if site:
                 owners[site] = None if site in owners else row["id"]
         out = []
         for c in candidates:
             if c.jurisdiction_id is None:
-                host = _bare_host(c.url)
+                host = bare_host(c.url)
                 labels = host.split(".")
                 for i in range(len(labels) - 1):  # gis.town.gov, then town.gov
                     suffix = ".".join(labels[i:])
@@ -495,12 +534,17 @@ class Store:
         seen_since: str | None = None,
         never_harvested: bool = False,
         linked_only: bool = False,
+        skip_failing: FailurePolicy | None = None,
+        only_failing: FailurePolicy | None = None,
         limit: int | None = None,
     ) -> list[Endpoint]:
         """Endpoints in harvest order: never harvested first, then least recently.
 
         Among endpoints never harvested, those a jurisdiction links to come first, so a
         limited harvest reaches what the crawler found before a bulk import's backlog.
+
+        `skip_failing` leaves out endpoints the policy says to skip; `only_failing`
+        returns just those.
         """
         linked = (
             "EXISTS (SELECT 1 FROM endpoint_jurisdictions ej WHERE ej.endpoint_id = endpoints.id)"
@@ -524,6 +568,10 @@ class Store:
             clauses.append("last_harvest_at IS NULL")
         if linked_only:
             clauses.append(linked)
+        for policy, op in ((skip_failing, "NOT IN"), (only_failing, "IN")):
+            if policy:
+                clauses.append(f"id {op} ({_FAILING_IDS})")
+                params += [policy.max_failures, policy.retry_cutoff()]
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self.db.execute(
             f"""SELECT * FROM endpoints {where}
@@ -667,14 +715,29 @@ class Store:
         )
         self.db.commit()
 
-    def record_check(self, endpoint_id: str, resp, detail: str | None) -> None:
+    def record_check(
+        self, endpoint_id: str, resp, detail: str | None, ok: bool | None = None
+    ) -> None:
+        """Record one check; `ok` overrides `resp.ok`, e.g. for an error body sent with a 200."""
         self.db.execute(
             "INSERT INTO checks VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
-                endpoint_id, utcnow(), resp.status, int(resp.ok), int(resp.elapsed * 1000),
-                int(resp.tls_insecure), detail,
+                endpoint_id, utcnow(), resp.status, int(resp.ok if ok is None else ok),
+                int(resp.elapsed * 1000), int(resp.tls_insecure), detail,
             ),
         )  # fmt: skip
+
+    def failing_endpoints(self, policy: FailurePolicy) -> list[sqlite3.Row]:
+        """Endpoints the policy skips, with their failure count and last error."""
+        return self.db.execute(
+            f"""SELECT e.id, e.platform, e.url, f.consecutive_failures, f.last_failed_at,
+                       (SELECT h.errors FROM harvests h WHERE h.endpoint_id = e.id
+                        ORDER BY h.id DESC LIMIT 1) AS last_errors
+                FROM endpoints e JOIN endpoint_failures f ON f.endpoint_id = e.id
+                WHERE e.id IN ({_FAILING_IDS})
+                ORDER BY f.consecutive_failures DESC, e.url""",
+            (policy.max_failures, policy.retry_cutoff()),
+        ).fetchall()
 
     # -- reporting -----------------------------------------------------------------
 

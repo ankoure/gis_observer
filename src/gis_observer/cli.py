@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
@@ -13,7 +14,7 @@ from .discovery import seeds
 from .discovery.govsearch import read_gis_links
 from .http import DEFAULT_USER_AGENT, Fetcher
 from .models import Platform
-from .store import Store
+from .store import FailurePolicy, Store
 from .util import parse_when
 
 DEFAULT_DB = Path(os.environ.get("GIS_OBSERVER_DB", "data/observer.sqlite"))
@@ -91,6 +92,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="only endpoints a jurisdiction links to (they come first anyway)",
     )
     h.add_argument("--concurrency", type=int, default=6)
+    h.add_argument(
+        "--include-failing",
+        action="store_true",
+        help="also harvest endpoints skipped for failing repeatedly",
+    )
+    _failure_args(h)
     h.set_defaults(func=cmd_harvest)
 
     cy = sub.add_parser("cycle", help="probe, harvest, probe the leads, harvest those, then check")
@@ -121,6 +128,12 @@ def build_parser() -> argparse.ArgumentParser:
     k = sub.add_parser("check", help="record whether endpoints are up")
     k.add_argument("--platform", nargs="*", choices=PLATFORMS, default=None)
     k.add_argument("--limit", type=int)
+    k.add_argument(
+        "--failing",
+        action="store_true",
+        help="only check endpoints skipped for failing; any that answer are harvested again",
+    )
+    _failure_args(k)
     k.set_defaults(func=cmd_check)
 
     a = sub.add_parser(
@@ -147,6 +160,26 @@ def build_parser() -> argparse.ArgumentParser:
     r = sub.add_parser("report", help="summarise the catalog")
     r.set_defaults(func=cmd_report)
     return p
+
+
+def _failure_args(parser: argparse.ArgumentParser) -> None:
+    d = FailurePolicy()
+    parser.add_argument(
+        "--max-failures",
+        type=int,
+        default=d.max_failures,
+        help="skip endpoints after this many failed harvests in a row (default %(default)s)",
+    )
+    parser.add_argument(
+        "--retry-failing-days",
+        type=float,
+        default=d.retry_after_days,
+        help="try skipped endpoints again after this many days (default %(default)s)",
+    )
+
+
+def _policy(args) -> FailurePolicy:
+    return FailurePolicy(args.max_failures, args.retry_failing_days)
 
 
 def _fetcher(args) -> Fetcher:
@@ -211,6 +244,7 @@ def cmd_harvest(args, store: Store) -> None:
                 store, f, args.raw_dir, platforms=platforms, ids=args.endpoint,
                 older_than_days=args.older_than_days, limit=args.limit,
                 concurrency=args.concurrency, linked_only=args.linked_only,
+                failure_policy=None if args.include_failing else _policy(args),
             )  # fmt: skip
 
     asyncio.run(go())
@@ -275,7 +309,10 @@ def cmd_check(args, store: Store) -> None:
 
     async def go():
         async with _fetcher(args) as f:
-            await pipeline.run_check(store, f, platforms=platforms, limit=args.limit)
+            await pipeline.run_check(
+                store, f, platforms=platforms, limit=args.limit,
+                only_failing=_policy(args) if args.failing else None,
+            )  # fmt: skip
 
     asyncio.run(go())
 
@@ -352,6 +389,17 @@ def _health_note(h: changes.Health) -> str:
     return f"down since {_when(h.down_since)} ({status}; {up})"
 
 
+def _first_error(errors: str | None, width: int = 60) -> str:
+    try:
+        first = json.loads(errors)[0] if errors else ""
+    except (ValueError, IndexError, TypeError):
+        first = errors or ""
+    first = str(first)
+    if first.startswith(("http://", "https://")) and ": " in first:
+        first = first.split(": ", 1)[1]  # the endpoint URL is already in its own column
+    return first if len(first) <= width else first[: width - 1] + "…"
+
+
 def cmd_report(args, store: Store) -> None:
     q = store.query
     j = q("SELECT COUNT(*), COUNT(last_crawled_at) FROM jurisdictions")[0]
@@ -380,6 +428,20 @@ def cmd_report(args, store: Store) -> None:
              FROM endpoints GROUP BY 1 ORDER BY 2 DESC"""),
         ["platform", "endpoints", "harvested", "ok", "failed/partial"],
     )
+    policy = FailurePolicy()
+    failing = store.failing_endpoints(policy)
+    _table(
+        f"skipped: {len(failing)} endpoints with {policy.max_failures}+ failed harvests in a row "
+        f"(retried {policy.retry_after_days:g} days after the last, or after a successful check)",
+        [
+            (r["platform"], r["url"], r["consecutive_failures"], r["last_failed_at"],
+             _first_error(r["last_errors"]))
+            for r in failing[:25]
+        ],
+        ["platform", "endpoint", "failures", "last failed", "last error"],
+    )  # fmt: skip
+    if len(failing) > 25:
+        print(f"  ... and {len(failing) - 25} more")
     _table(
         "viewer vendors",
         q("""SELECT vendor, COUNT(*) FROM endpoints WHERE platform = 'viewer'

@@ -62,6 +62,11 @@ that failed and came back up:
 uv run gis-observer changes --since 30d            # optional: --endpoint ID, --platform P, --kind layer
 ```
 
+Endpoints that fail 3 harvests in a row (`--max-failures`) are skipped. They are tried
+again 30 days after the last failure (`--retry-failing-days`), or sooner if
+`check --failing` finds them answering. `report` lists the skipped ones. Use
+`harvest --include-failing`, or name endpoints with `--endpoint`, to harvest them anyway.
+
 Other sources:
 
 ```sh
