@@ -137,6 +137,18 @@ def test_keywords_are_words():
     assert not is_gis_candidate("https://maps.google.com/?q=town+hall", "Map")
 
 
+@pytest.mark.parametrize(
+    "url, text",
+    [
+        ("https://maps.live.com/default.aspx?where1=1+Main+St", "Bing"),
+        ("http://maps.yahoo.com/maps_result?addr=1+Main+St", "Directions"),
+        ("https://view.officeapps.live.com/op/embed.aspx?src=x", "Zoning map"),
+    ],
+)
+def test_consumer_map_sites_are_not_candidates(url, text):
+    assert not is_gis_candidate(url, text)
+
+
 def test_arcgis_endpoint_identity_ignores_case_except_on_arcgis_com():
     a = classify("https://gisportal.boston.gov/arcgis/rest/services/X/MapServer")
     b = classify("https://gisportal.boston.gov/ArcGIS/rest/services/Y/MapServer")
