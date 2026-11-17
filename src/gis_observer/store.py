@@ -168,6 +168,45 @@ class Store:
             have = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
             if column not in have:
                 self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+        self._rekey_viewers()
+
+    def _rekey_viewers(self) -> None:
+        """Merge viewer rows stored under ids from an older `Endpoint.identity`.
+
+        Viewer ids were once the URL as first seen, so one town's viewer could be stored
+        several times (http/https, www./next. host aliases, slug case). Rows are moved to
+        the current id, oldest first, so the merged row keeps the first URL seen.
+        """
+        rows = self.db.execute(
+            "SELECT * FROM endpoints WHERE platform = ? ORDER BY first_seen, id",
+            (Platform.VIEWER.value,),
+        ).fetchall()
+        for r in rows:
+            old = r["id"]
+            new = Endpoint(Platform.VIEWER, r["url"], r["vendor"], r["label"]).id
+            if new == old:
+                continue
+            if self.db.execute("SELECT 1 FROM endpoints WHERE id = ?", (new,)).fetchone():
+                self.db.execute(
+                    """UPDATE endpoints SET vendor = COALESCE(vendor, ?),
+                         label = COALESCE(label, ?), first_seen = MIN(first_seen, ?)
+                       WHERE id = ?""",
+                    (r["vendor"], r["label"], r["first_seen"], new),
+                )
+                self.db.execute("DELETE FROM endpoints WHERE id = ?", (old,))
+            else:
+                self.db.execute("UPDATE endpoints SET id = ? WHERE id = ?", (new, old))
+            # Tables keyed on endpoint_id keep the merged row's entry on a clash.
+            for table in ("endpoint_jurisdictions", "assets", "asset_versions"):
+                self.db.execute(
+                    f"UPDATE OR IGNORE {table} SET endpoint_id = ? WHERE endpoint_id = ?",
+                    (new, old),
+                )
+                self.db.execute(f"DELETE FROM {table} WHERE endpoint_id = ?", (old,))
+            for table in ("candidates", "harvests", "checks"):
+                self.db.execute(
+                    f"UPDATE {table} SET endpoint_id = ? WHERE endpoint_id = ?", (new, old)
+                )
 
     def close(self) -> None:
         self.db.commit()
