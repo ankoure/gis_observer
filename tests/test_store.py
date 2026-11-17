@@ -190,3 +190,41 @@ def test_jurisdiction_assets_and_coverage():
         {"state": "MA", "total": 5, "own_domain": 1, "linked_only": 1, "crawl_failed": 1,
          "nothing_found": 1, "not_crawled": 1},
     ]  # fmt: skip
+
+
+def test_old_viewer_ids_are_merged(tmp_path):
+    from gis_observer.models import stable_id
+
+    path = tmp_path / "old.sqlite"
+    store = Store(path)
+    store.upsert_jurisdictions([Jurisdiction("osm:1", "Hampden", "https://hampden.gov")])
+    # As stored before viewer ids folded scheme, host alias and slug case.
+    old = [
+        ("https://www.axisgis.com/hampdenma", "2024-01-02"),
+        ("https://next.axisgis.com/HampdenMA", "2024-01-01"),
+    ]
+    for url, seen in old:
+        oid = stable_id(Platform.VIEWER, url)
+        store.db.execute(
+            """INSERT INTO endpoints (id, platform, url, vendor, first_seen)
+               VALUES (?, 'viewer', ?, 'AxisGIS', ?)""",
+            (oid, url, seen),
+        )
+        store.db.execute(
+            """INSERT INTO endpoint_jurisdictions VALUES (?, 'osm:1', 'linked', ?)""",
+            (oid, f"https://hampden.gov/maps?{seen}"),
+        )
+        store.db.execute(
+            "INSERT INTO candidates (url, via, first_seen, endpoint_id) VALUES (?, 'crawl', ?, ?)",
+            (url, seen, oid),
+        )
+    store.close()
+
+    store = Store(path)
+    ep = Endpoint(Platform.VIEWER, "https://www.axisgis.com/HampdenMA", vendor="AxisGIS")
+    eps = store.query("SELECT id, url, first_seen FROM endpoints")
+    assert [tuple(r) for r in eps] == [(ep.id, "https://next.axisgis.com/HampdenMA", "2024-01-01")]
+    links = store.query("SELECT endpoint_id, jurisdiction_id FROM endpoint_jurisdictions")
+    assert [tuple(r) for r in links] == [(ep.id, "osm:1")]
+    cands = store.query("SELECT DISTINCT endpoint_id FROM candidates")
+    assert [r[0] for r in cands] == [ep.id]
