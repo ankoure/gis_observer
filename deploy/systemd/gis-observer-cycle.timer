@@ -1,0 +1,11 @@
+[Unit]
+Description=Run gis-observer cycle weekly
+
+[Timer]
+OnCalendar=Sun *-*-* 03:00:00
+RandomizedDelaySec=1h
+# Catch up after the machine was off at the scheduled time.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -139,6 +139,61 @@ def test_harvest_one_end_to_end(tmp_path):
     assert harvest["raw_path"].endswith(".jsonl.gz")
 
 
+def test_linked_endpoints_harvested_first():
+    store = Store(":memory:")
+    store.upsert_jurisdictions([Jurisdiction("osm:1", "Town", "https://town.gov")])
+    old = Endpoint(Platform.ARCGIS_REST, "https://old.gov/arcgis/rest/services")
+    store.upsert_endpoint(old, via="import:servers.csv")
+    pipeline.ingest_candidates(store, [Candidate(EP.url, "crawl", jurisdiction_id="osm:1")])
+
+    assert [e.url for e in store.endpoints(limit=1)] == [EP.url]
+    assert [e.url for e in store.endpoints(linked_only=True)] == [EP.url]
+    # once harvested, the linked endpoint waits its turn like any other
+    _apply(store, [])
+    store.finish_harvest(1, EP.id, status="ok", counts={"new": 0, "changed": 0, "removed": 0},
+                         n_assets=0, n_candidates=0, errors=[], raw_path=None)  # fmt: skip
+    assert [e.url for e in store.endpoints()] == [old.url, EP.url]
+    assert store.endpoints(never_harvested=True, linked_only=True) == []
+
+
+def test_cycle_follows_leads(tmp_path):
+    store = Store(":memory:")
+    store.upsert_jurisdictions([Jurisdiction("osm:1", "Town", "https://town.gov")])
+    old = Endpoint(Platform.ARCGIS_REST, "https://old.gov/arcgis/rest/services")
+    store.upsert_endpoint(old, via="import:servers.csv")
+    store.add_candidate(Candidate("https://town.gov/gis", "crawl", jurisdiction_id="osm:1"))
+    store.commit()
+    portal = "https://town.maps.arcgis.com"
+    hosted = "https://services1.arcgis.com/ORG1/arcgis/rest/services"
+    routes = {
+        "https://town.gov/gis": f"<a href='{portal}/home/index.html'>Town GIS maps</a>",
+        f"{portal}/sharing/rest/portals/self": {"id": "ORG1", "name": "Town"},
+        f"{portal}/sharing/rest/search": {
+            "nextStart": -1,
+            "results": [{"id": "a" * 32, "type": "Feature Service", "title": "Parcels",
+                         "url": f"{hosted}/P/FeatureServer"}],
+        },
+        hosted: {"currentVersion": 11.1, "folders": [], "services": []},
+    }  # fmt: skip
+
+    async def go():
+        async with make_fetcher(routes) as http:
+            return await pipeline.run_cycle(store, http, tmp_path, harvest_limit=1)
+
+    stages = asyncio.run(go())
+    assert stages["probe"]["found"] == 1
+    # the portal the town links to beats the older, unlinked import
+    assert (stages["harvest"]["endpoints"], stages["harvest"]["ok"]) == (1, 1)
+    assert stages["harvest"]["leads"] == 1
+    # the hosted server that harvest turned up is harvested in the same cycle
+    assert (stages["harvest new"]["endpoints"], stages["harvest new"]["ok"]) == (1, 1)
+    assert stages["check"]["endpoints"] == 3
+    harvested = {
+        r[0] for r in store.query("SELECT url FROM endpoints WHERE last_harvest_at IS NOT NULL")
+    }
+    assert harvested == {portal, hosted}
+
+
 def test_old_database_gains_crawl_columns(tmp_path):
     import sqlite3
 

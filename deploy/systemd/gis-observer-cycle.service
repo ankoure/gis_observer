@@ -1,0 +1,20 @@
+# One run of `gis-observer cycle`. Started weekly by gis-observer-cycle.timer.
+# Edit WorkingDirectory, User and the uv path for your machine; see deploy/README.md.
+[Unit]
+Description=gis-observer: probe, harvest, follow leads, check
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=gis-observer
+WorkingDirectory=/opt/gis_observer
+EnvironmentFile=/etc/gis-observer.env
+ExecStart=/usr/local/bin/uv run --frozen gis-observer cycle
+# A full cycle can take many hours; oneshot units have no start timeout by default.
+# systemd won't start the unit again while a run is still going.
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

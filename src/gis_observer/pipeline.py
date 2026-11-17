@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import Counter
 from collections.abc import Callable, Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -23,6 +24,7 @@ from .http import Fetcher, HttpGetter
 from .models import Asset, Candidate, Endpoint, Platform
 from .raw import RawCapture, ReplayFetcher, raw_files, raw_path
 from .store import Store
+from .util import utcnow
 
 log = logging.getLogger(__name__)
 
@@ -101,9 +103,11 @@ async def run_crawl(
         )  # fmt: skip
 
 
-async def run_probe(store: Store, fetcher: Fetcher, *, limit=None, concurrency=8) -> None:
+async def run_probe(store: Store, fetcher: Fetcher, *, limit=None, concurrency=8) -> Counter:
+    """Probe candidates still `new`. Returns a tally of statuses plus `endpoints` found."""
     rows = store.candidates_with_status("new", limit)
     log.info("probing %d unrecognised candidates", len(rows))
+    tally: Counter = Counter(candidates=len(rows))
 
     async def check(row):
         try:
@@ -114,7 +118,10 @@ async def run_probe(store: Store, fetcher: Fetcher, *, limit=None, concurrency=8
 
     async for row, result in _bounded(rows, check, concurrency):
         if result is None:
+            tally["error"] += 1
             continue
+        tally[result.status] += 1
+        tally["endpoints"] += len(result.endpoints)
         for ep in result.endpoints:
             # A lead from a harvested catalog keeps its harvest:<id> origin for inheritance.
             via = row["via"] if row["via"].startswith("harvest:") else "probe"
@@ -126,29 +133,39 @@ async def run_probe(store: Store, fetcher: Fetcher, *, limit=None, concurrency=8
             log.info(
                 "%s -> %s", row["url"], ", ".join(f"{e.platform}:{e.url}" for e in result.endpoints)
             )
+    return tally
 
 
 async def run_harvest(
     store: Store, fetcher: Fetcher, raw_dir: Path, *, platforms: list[Platform] | None = None,
     ids: list[str] | None = None, older_than_days: float | None = 7, limit=None, concurrency=6,
-) -> None:  # fmt: skip
+    linked_only: bool = False,
+) -> Counter:  # fmt: skip
+    """Harvest endpoints that are due. Returns a tally of statuses and asset/lead counts."""
     harvestable = [p for p in (platforms or Harvester.platforms()) if p in Harvester.platforms()]
     cutoff = None
     if older_than_days and older_than_days > 0 and not ids:  # 0 means harvest everything
         cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat(timespec="seconds")
-    endpoints = store.endpoints(platforms=harvestable, ids=ids, older_than=cutoff, limit=limit)
+    endpoints = store.endpoints(
+        platforms=harvestable, ids=ids, older_than=cutoff, linked_only=linked_only, limit=limit
+    )  # fmt: skip
     log.info("harvesting %d endpoints", len(endpoints))
+    tally: Counter = Counter(endpoints=len(endpoints))
     async for _ep, _ in _bounded(
-        endpoints, lambda ep: harvest_one(store, fetcher, raw_dir, ep), concurrency
+        endpoints, lambda ep: harvest_one(store, fetcher, raw_dir, ep, tally), concurrency
     ):
         pass
+    return tally
 
 
-async def harvest_one(store: Store, fetcher: Fetcher, raw_dir: Path, endpoint: Endpoint) -> str:
+async def harvest_one(
+    store: Store, fetcher: Fetcher, raw_dir: Path, endpoint: Endpoint, tally: Counter | None = None
+) -> str:
     capture = RawCapture(fetcher)
     return await _harvest(
-        store, capture, endpoint, save_raw=lambda: capture.write(raw_path(raw_dir, endpoint))
-    )
+        store, capture, endpoint, save_raw=lambda: capture.write(raw_path(raw_dir, endpoint)),
+        tally=tally,
+    )  # fmt: skip
 
 
 async def replay_one(store: Store, path: Path, endpoint: Endpoint) -> str:
@@ -170,7 +187,7 @@ async def replay_one(store: Store, path: Path, endpoint: Endpoint) -> str:
 
 async def _harvest(
     store: Store, http: HttpGetter, endpoint: Endpoint, *, save_raw: Callable[[], Path | None],
-    started_at: str | None = None, finished_at: str | None = None,
+    started_at: str | None = None, finished_at: str | None = None, tally: Counter | None = None,
 ) -> str:  # fmt: skip
     harvester = Harvester.for_platform(endpoint.platform, http)
     if harvester is None:
@@ -198,6 +215,10 @@ async def _harvest(
         n_candidates=len(found), errors=errors, raw_path=str(path) if path else None,
         finished_at=finished_at,
     )  # fmt: skip
+    if tally is not None:
+        tally[status] += 1
+        tally.update(counts)
+        tally["leads"] += len(found)
     log.info(
         "%s %s: %s, %d assets (+%d new, %d changed, %d removed), %d leads%s",
         endpoint.platform, endpoint.url, status, len(assets), counts["new"], counts["changed"],
@@ -260,8 +281,10 @@ def _check_request(ep: Endpoint) -> tuple[str, dict | None, int]:
 
 async def run_check(
     store: Store, fetcher: Fetcher, *, platforms=None, limit=None, concurrency=8
-) -> None:
+) -> Counter:
+    """Record whether endpoints respond. Returns a tally of `up` and `down`."""
     endpoints = store.endpoints(platforms=platforms, limit=limit)
+    tally: Counter = Counter(endpoints=len(endpoints))
 
     async def check(ep):
         url, params, max_bytes = _check_request(ep)
@@ -278,4 +301,44 @@ async def run_check(
                 detail = f"error {data['error']}"
         store.record_check(ep.id, resp, detail or resp.error)
         store.commit()
+        tally["up" if resp.ok else "down"] += 1
         log.info("%s %s -> %s %s", ep.platform, ep.url, resp.status, detail or resp.error or "")
+    return tally
+
+
+async def run_cycle(
+    store: Store, fetcher: Fetcher, raw_dir: Path, *, probe_limit=None, harvest_limit=None,
+    lead_harvest_limit=None, check_limit=None, older_than_days: float = 7,
+    linked_only: bool = False, skip_check: bool = False,
+) -> dict[str, Counter]:  # fmt: skip
+    """One turn of the discovery loop: probe, harvest, probe the leads, harvest those, check.
+
+    Harvests produce leads, probing turns leads into endpoints, and those endpoints need
+    harvesting. The second harvest takes only endpoints first seen during this cycle,
+    so it covers what the first harvest and second probe turned up.
+    """
+    started = utcnow()
+    before = {r[0] for r in store.query("SELECT id FROM endpoints")}
+    stages: dict[str, Counter] = {}
+    log.info("cycle: probing new candidates")
+    stages["probe"] = await run_probe(store, fetcher, limit=probe_limit)
+    log.info("cycle: harvesting due endpoints")
+    stages["harvest"] = await run_harvest(
+        store, fetcher, raw_dir, older_than_days=older_than_days, limit=harvest_limit,
+        linked_only=linked_only,
+    )  # fmt: skip
+    log.info("cycle: probing leads")
+    stages["probe leads"] = await run_probe(store, fetcher, limit=probe_limit)
+    log.info("cycle: harvesting new endpoints")
+    found = store.endpoints(seen_since=started, never_harvested=True, linked_only=linked_only)
+    new_ids = [e.id for e in found if e.id not in before]
+    if new_ids:  # an empty ids list would mean "everything due"
+        stages["harvest new"] = await run_harvest(
+            store, fetcher, raw_dir, ids=new_ids, limit=lead_harvest_limit
+        )
+    else:
+        stages["harvest new"] = Counter(endpoints=0)
+    if not skip_check:
+        log.info("cycle: checking endpoints")
+        stages["check"] = await run_check(store, fetcher, limit=check_limit)
+    return stages

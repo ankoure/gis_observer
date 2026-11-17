@@ -85,8 +85,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip endpoints harvested more recently than this; 0 harvests all (default %(default)s)",
     )
     h.add_argument("--limit", type=int)
+    h.add_argument(
+        "--linked-only",
+        action="store_true",
+        help="only endpoints a jurisdiction links to (they come first anyway)",
+    )
     h.add_argument("--concurrency", type=int, default=6)
     h.set_defaults(func=cmd_harvest)
+
+    cy = sub.add_parser("cycle", help="probe, harvest, probe the leads, harvest those, then check")
+    cy.add_argument("--probe-limit", type=int, help="candidates per probe stage")
+    cy.add_argument("--harvest-limit", type=int, help="due endpoints to harvest")
+    cy.add_argument("--lead-harvest-limit", type=int, help="endpoints found this cycle to harvest")
+    cy.add_argument("--check-limit", type=int, help="endpoints to check")
+    cy.add_argument("--older-than-days", type=float, default=7)
+    cy.add_argument("--linked-only", action="store_true")
+    cy.add_argument("--no-check", action="store_true", help="skip the check stage")
+    cy.set_defaults(func=cmd_cycle)
 
     rp = sub.add_parser(
         "replay",
@@ -193,10 +208,40 @@ def cmd_harvest(args, store: Store) -> None:
             await pipeline.run_harvest(
                 store, f, args.raw_dir, platforms=platforms, ids=args.endpoint,
                 older_than_days=args.older_than_days, limit=args.limit,
-                concurrency=args.concurrency,
+                concurrency=args.concurrency, linked_only=args.linked_only,
             )  # fmt: skip
 
     asyncio.run(go())
+
+
+def cmd_cycle(args, store: Store) -> None:
+    async def go():
+        async with _fetcher(args) as f:
+            return await pipeline.run_cycle(
+                store, f, args.raw_dir, probe_limit=args.probe_limit,
+                harvest_limit=args.harvest_limit, lead_harvest_limit=args.lead_harvest_limit,
+                check_limit=args.check_limit, older_than_days=args.older_than_days,
+                linked_only=args.linked_only, skip_check=args.no_check,
+            )  # fmt: skip
+
+    print_cycle_summary(asyncio.run(go()))
+
+
+# Columns per stage kind, in display order; anything else a tally holds is appended.
+_SUMMARY_KEYS = {
+    "probe": ["candidates", "found", "none", "dead", "error", "endpoints"],
+    "harvest": ["endpoints", "ok", "partial", "failed", "new", "changed", "removed",
+                "returned", "leads"],
+    "check": ["endpoints", "up", "down"],
+}  # fmt: skip
+
+
+def print_cycle_summary(stages: dict) -> None:
+    print("\ncycle summary")
+    for stage, tally in stages.items():
+        keys = _SUMMARY_KEYS[stage.split()[0]]
+        keys = keys + sorted(k for k in tally if k not in keys)
+        print(f"  {stage:<12} " + ", ".join(f"{k} {tally.get(k, 0)}" for k in keys))
 
 
 def cmd_replay(args, store: Store) -> int:

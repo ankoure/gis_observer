@@ -34,11 +34,24 @@ uv run gis-observer harvest --limit 50
 uv run gis-observer report
 ```
 
-Re-run `harvest` on a schedule. Endpoints harvested within `--older-than-days`
-(default 7) are skipped, and each run records new, changed, removed and returned
-assets. Harvests also produce leads: a CKAN dataset that points at an ArcGIS server,
-or an ArcGIS Online item hosted on a county server. Those become endpoints, so
-running `probe` and `harvest` again widens the catalog.
+Endpoints harvested within `--older-than-days` (default 7) are skipped, and each run
+records new, changed, removed and returned assets. Harvests also produce leads: a CKAN
+dataset that points at an ArcGIS server, or an ArcGIS Online item hosted on a county
+server. Those become endpoints, so running `probe` and `harvest` again widens the
+catalog. Among endpoints never harvested, those a jurisdiction links to go first;
+`harvest --linked-only` takes only those.
+
+`cycle` runs that loop once: probe new candidates, harvest what's due, probe the
+leads, harvest the endpoints found along the way, then `check`, and prints a summary.
+Each stage takes a limit:
+
+```sh
+uv run gis-observer cycle --probe-limit 500 --harvest-limit 300 --lead-harvest-limit 200
+```
+
+Run it weekly on a machine that keeps `data/`; [deploy/README.md](deploy/README.md) has
+a systemd timer and a cron line. Set `GIS_OBSERVER_USER_AGENT` there to something with a
+contact URL.
 
 To see what changed, run `changes`. It lists each endpoint's new, changed, removed and
 returned assets, and the fields that differ for each changed one. An endpoint's first
@@ -96,10 +109,11 @@ src/gis_observer/
   http.py            polite async client (per-host pacing, retries, TLS fallback)
   raw.py             landing zone for raw responses
   store.py           SQLite schema, upserts, change tracking
-  pipeline.py        crawl / probe / harvest / check, wired to the store
+  pipeline.py        crawl / probe / harvest / check / cycle, wired to the store
   cli.py
   discovery/         seeds, site crawler, govsearch reader, prober, link extraction
   harvesters/        arcgis_rest, arcgis_portal, ogc, ckan, dcat, files
 data/seeds/          MA municipalities (govsearch), ArcGIS servers (Munger, 2024)
 sql/athena/          Common Crawl x .gov queries, ported from the Munger
+deploy/              systemd timer, cron line and environment for the weekly cycle
 ```
