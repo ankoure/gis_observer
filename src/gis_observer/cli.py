@@ -50,6 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("file", type=Path)
     s.add_argument("--types", nargs="*", default=[], help="dotgov: Domain types, e.g. City County")
     s.add_argument("--states", nargs="*", default=[], help="dotgov: two-letter states")
+    s.add_argument("--state", help="osm: the seeds' two-letter state, e.g. MA")
+    s.add_argument("--kind", dest="jkind", help="osm: what the seeds are, e.g. Municipality")
     s.set_defaults(func=cmd_seeds)
 
     c = sub.add_parser("crawl", help="crawl jurisdiction websites for GIS links")
@@ -101,7 +103,8 @@ def _fetcher(args) -> Fetcher:
 
 def cmd_seeds(args, store: Store) -> None:
     if args.kind == "osm":
-        n = store.upsert_jurisdictions(seeds.load_osm_seeds(args.file))
+        rows = seeds.load_osm_seeds(args.file, state=args.state, kind=args.jkind)
+        n = store.upsert_jurisdictions(rows)
         print(f"{n} jurisdictions loaded")
     elif args.kind == "dotgov":
         rows = seeds.load_dotgov(args.file, types=args.types, states=args.states)
@@ -185,6 +188,18 @@ def cmd_report(args, store: Store) -> None:
     q = store.query
     j = q("SELECT COUNT(*), COUNT(last_crawled_at) FROM jurisdictions")[0]
     print(f"jurisdictions: {j[0]} ({j[1]} crawled)")
+    _table(
+        "coverage: what each jurisdiction's discovery found",
+        [tuple(r) for r in store.coverage()],
+        ["state", "total", "own domain", "linked only", "crawl failed", "nothing found",
+         "not crawled"],
+    )  # fmt: skip
+    _table(
+        "crawl failures",
+        q("""SELECT crawl_failure, COUNT(*) FROM jurisdictions
+             WHERE crawl_failure IS NOT NULL GROUP BY 1 ORDER BY 2 DESC"""),
+        ["reason", "n"],
+    )
     _table(
         "candidates by status",
         q("SELECT status, COUNT(*) FROM candidates GROUP BY 1 ORDER BY 2 DESC"),

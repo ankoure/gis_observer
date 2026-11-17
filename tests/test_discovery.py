@@ -50,7 +50,9 @@ def test_crawl_follows_gis_pages_and_obeys_robots():
         async with make_fetcher(SITE) as http:
             return await crawl_site(http, town, max_pages=10, max_depth=2)
 
-    found = {c.url: c for c in asyncio.run(go())}
+    result = asyncio.run(go())
+    assert (result.pages, result.failure) == (4, None)
+    found = {c.url: c for c in result.candidates}
     assert set(found) == {
         "https://www.axisgis.com/TownMA/",
         "https://gis.town.gov/arcgis/rest/services",
@@ -81,7 +83,7 @@ def test_crawl_skips_document_links_and_weak_leftovers():
             return await crawl_site(http, town, max_pages=1)
 
     # Only the unvisited page with a strong GIS word is passed on to the prober.
-    assert [c.url for c in asyncio.run(go())] == ["https://www.town.gov/gis"]
+    assert [c.url for c in asyncio.run(go()).candidates] == ["https://www.town.gov/gis"]
 
 
 def test_probe_scans_a_maps_page():
@@ -145,3 +147,30 @@ def test_govsearch_reader_scrolls():
     assert cand.jurisdiction_id == "osm:relation/1181603"
     assert cand.via == "govsearch"
     assert calls[-1] == ("DELETE", "/_search/scroll")
+
+
+def test_crawl_records_why_nothing_was_fetched():
+    town = Jurisdiction("osm:relation/3", "Town", "https://www.town.gov")
+    challenge = httpx.Response(403, text="<title>Just a moment...</title>")
+
+    async def go(routes):
+        async with make_fetcher(routes) as http:
+            return await crawl_site(http, town)
+
+    blocked = asyncio.run(go({"https://www.town.gov": challenge}))
+    assert (blocked.pages, blocked.failure) == (0, "blocked")
+    robots = httpx.Response(200, text="User-agent: *\nDisallow: /\n")
+    assert asyncio.run(go({"https://www.town.gov/robots.txt": robots})).failure == "robots"
+    assert asyncio.run(go({})).failure == "http_404"
+
+
+def test_osm_seeds_take_state_and_kind(tmp_path):
+    from gis_observer.discovery.seeds import load_osm_seeds
+
+    path = tmp_path / "seeds.csv"
+    path.write_text("@id,source_name,website\nrelation/1,Granville,townofgranville.net\n")
+    (j,) = load_osm_seeds(path, state="ma", kind="Municipality")
+    assert (j.id, j.state, j.kind, j.website) == (
+        "osm:relation/1", "MA", "Municipality", "https://townofgranville.net",
+    )  # fmt: skip
+    assert load_osm_seeds(path)[0].state is None

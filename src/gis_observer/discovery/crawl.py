@@ -12,11 +12,12 @@ from __future__ import annotations
 import heapq
 import itertools
 import logging
+from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 from urllib.robotparser import RobotFileParser
 
 from ..classify import classify, has_gis_keyword, is_gis_candidate
-from ..http import HttpGetter
+from ..http import HttpGetter, Response
 from ..models import Candidate, Jurisdiction
 from .links import extract_links
 
@@ -59,13 +60,35 @@ def _followable(url: str, text: str = "") -> bool:
     return "(pdf)" not in text.lower()
 
 
+@dataclass
+class CrawlResult:
+    candidates: list[Candidate] = field(default_factory=list)
+    pages: int = 0
+    # Why no page was fetched: blocked | dead | robots | http_<status> | not_html.
+    failure: str | None = None
+
+
+def _start_failure(resp: Response) -> str:
+    """Why the start page gave us nothing to read."""
+    if resp.status in (401, 403, 429) or "just a moment" in resp.text[:5000].lower():
+        return "blocked"  # includes Cloudflare's JavaScript challenge
+    if resp.error is not None or resp.status is None:
+        return "dead"
+    if not resp.ok:
+        return f"http_{resp.status}"
+    return "not_html"
+
+
 async def crawl_site(
     http: HttpGetter, jurisdiction: Jurisdiction, *, max_pages: int = 40, max_depth: int = 2
-) -> list[Candidate]:
+) -> CrawlResult:
     if not jurisdiction.website:
-        return []
+        return CrawlResult()
     start = jurisdiction.website
     robots = await load_robots(http, start)
+    if not robots.can_fetch(ROBOTS_AGENT, start):
+        return CrawlResult(failure="robots")
+    start_failure = None
     order = itertools.count()
     queue: list[tuple[int, int, int, str]] = [(0, 0, next(order), start)]
     queued = {start}
@@ -80,6 +103,8 @@ async def crawl_site(
             continue
         resp = await http.get(url, max_bytes=5_000_000)
         if not resp.ok or "html" not in resp.headers.get("content-type", "").lower():
+            if url == start:
+                start_failure = _start_failure(resp)
             continue
         visited.add(url)
         site_hosts.add(_bare(urlsplit(resp.url).hostname))  # town.gov -> www.town.gov redirects
@@ -116,4 +141,6 @@ async def crawl_site(
         if url not in visited and url not in found:
             found[url] = cand
     log.info("%s: %d pages, %d candidates", jurisdiction.name, len(visited), len(found))
-    return list(found.values())
+    return CrawlResult(
+        list(found.values()), len(visited), None if visited else start_failure or "no_pages"
+    )

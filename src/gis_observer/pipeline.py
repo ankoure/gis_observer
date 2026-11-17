@@ -16,7 +16,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .classify import classify
-from .discovery.crawl import crawl_site
+from .discovery.crawl import CrawlResult, crawl_site
 from .discovery.probe import probe
 from .harvesters import Harvester
 from .http import Fetcher
@@ -72,13 +72,16 @@ async def run_crawl(
             return await crawl_site(fetcher, j, max_pages=max_pages, max_depth=max_depth)
         except Exception:
             log.exception("crawl failed: %s", j.website)
-            return []
+            return CrawlResult(failure="error")
 
-    async for j, cands in _bounded(sites, crawl, concurrency):
-        new, classified = ingest_candidates(store, cands)
-        store.mark_crawled(j.id)
+    async for j, result in _bounded(sites, crawl, concurrency):
+        new, classified = ingest_candidates(store, result.candidates)
+        store.mark_crawled(j.id, pages=result.pages, failure=result.failure)
         store.commit()
-        log.info("%s: %d candidates (%d new, %d recognised)", j.name, len(cands), new, classified)
+        log.info(
+            "%s: %d candidates (%d new, %d recognised)%s", j.name, len(result.candidates), new,
+            classified, f", failed: {result.failure}" if result.failure else "",
+        )  # fmt: skip
 
 
 async def run_probe(store: Store, fetcher: Fetcher, *, limit=None, concurrency=8) -> None:

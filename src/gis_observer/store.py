@@ -28,7 +28,9 @@ CREATE TABLE IF NOT EXISTS jurisdictions (
     kind TEXT,
     state TEXT,
     source TEXT,
-    last_crawled_at TEXT
+    last_crawled_at TEXT,
+    crawl_pages INTEGER,                  -- pages fetched by the last crawl
+    crawl_failure TEXT                    -- why it fetched none: blocked | dead | robots | ...
 );
 CREATE TABLE IF NOT EXISTS candidates (
     url TEXT PRIMARY KEY,
@@ -122,7 +124,21 @@ CREATE VIEW IF NOT EXISTS current_assets AS
     SELECT e.platform, e.url AS endpoint_url, e.vendor, a.*
     FROM assets a JOIN endpoints e ON e.id = a.endpoint_id
     WHERE a.removed_at IS NULL;
+-- Which jurisdictions publish what: "which MA towns publish parcels, where, and how?"
+CREATE VIEW IF NOT EXISTS jurisdiction_assets AS
+    SELECT j.id AS jurisdiction_id, j.name AS jurisdiction_name, j.state,
+           j.kind AS jurisdiction_kind, ej.relation, ej.evidence_url, ca.*
+    FROM jurisdictions j
+    JOIN endpoint_jurisdictions ej ON ej.jurisdiction_id = j.id
+    JOIN current_assets ca ON ca.endpoint_id = ej.endpoint_id;
 """
+
+# Columns added after a table was first created: (table, column, type).
+# CREATE TABLE IF NOT EXISTS leaves existing tables alone, so these are added by hand.
+MIGRATIONS = (
+    ("jurisdictions", "crawl_pages", "INTEGER"),
+    ("jurisdictions", "crawl_failure", "TEXT"),
+)
 
 ASSET_COLUMNS = (
     "endpoint_id, key, kind, name, title, url, parent_key, service_type, geometry_type, format, "
@@ -144,7 +160,14 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
+        self._migrate()
         self.db.commit()
+
+    def _migrate(self) -> None:
+        for table, column, kind in MIGRATIONS:
+            have = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            if column not in have:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
     def close(self) -> None:
         self.db.commit()
@@ -160,7 +183,8 @@ class Store:
             """INSERT INTO jurisdictions (id, name, website, kind, state, source)
                VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT(id) DO UPDATE SET name=excluded.name, website=excluded.website,
-                 kind=excluded.kind, state=excluded.state, source=excluded.source""",
+                 kind=COALESCE(excluded.kind, jurisdictions.kind),
+                 state=COALESCE(excluded.state, jurisdictions.state), source=excluded.source""",
             [(j.id, j.name, j.website, j.kind, j.state, j.source) for j in rows],
         )
         self.db.commit()
@@ -179,9 +203,13 @@ class Store:
             for r in rows
         ]
 
-    def mark_crawled(self, jurisdiction_id: str) -> None:
+    def mark_crawled(
+        self, jurisdiction_id: str, *, pages: int | None = None, failure: str | None = None
+    ) -> None:
         self.db.execute(
-            "UPDATE jurisdictions SET last_crawled_at = ? WHERE id = ?", (utcnow(), jurisdiction_id)
+            """UPDATE jurisdictions SET last_crawled_at = ?, crawl_pages = ?, crawl_failure = ?
+               WHERE id = ?""",
+            (utcnow(), pages, failure, jurisdiction_id),
         )
 
     # -- candidates ----------------------------------------------------------------
@@ -380,6 +408,28 @@ class Store:
         )  # fmt: skip
 
     # -- reporting -----------------------------------------------------------------
+
+    def coverage(self) -> list[sqlite3.Row]:
+        """Per state, how many jurisdictions fall in each discovery outcome.
+
+        Each jurisdiction counts once, in the first group that fits: an endpoint on its
+        own domain, only links to endpoints elsewhere, crawl failed, crawled and
+        nothing found, not crawled yet.
+        """
+        return self.db.execute(
+            """WITH found AS (
+                 SELECT jurisdiction_id, MAX(relation = 'same_domain') AS own
+                 FROM endpoint_jurisdictions GROUP BY 1)
+               SELECT j.state, COUNT(*) AS total,
+                 SUM(COALESCE(f.own = 1, 0)) AS own_domain,
+                 SUM(COALESCE(f.own = 0, 0)) AS linked_only,
+                 SUM(f.jurisdiction_id IS NULL AND j.crawl_failure IS NOT NULL) AS crawl_failed,
+                 SUM(f.jurisdiction_id IS NULL AND j.last_crawled_at IS NOT NULL
+                     AND j.crawl_failure IS NULL) AS nothing_found,
+                 SUM(f.jurisdiction_id IS NULL AND j.last_crawled_at IS NULL) AS not_crawled
+               FROM jurisdictions j LEFT JOIN found f ON f.jurisdiction_id = j.id
+               GROUP BY 1 ORDER BY 2 DESC"""
+        ).fetchall()
 
     def query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
         return self.db.execute(sql, params).fetchall()
