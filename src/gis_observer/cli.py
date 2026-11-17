@@ -8,12 +8,13 @@ import logging
 import os
 from pathlib import Path
 
-from . import pipeline
+from . import changes, pipeline
 from .discovery import seeds
 from .discovery.govsearch import read_gis_links
 from .http import DEFAULT_USER_AGENT, Fetcher
 from .models import Platform
 from .store import Store
+from .util import parse_when
 
 DEFAULT_DB = Path(os.environ.get("GIS_OBSERVER_DB", "data/observer.sqlite"))
 DEFAULT_RAW = Path(os.environ.get("GIS_OBSERVER_RAW", "data/raw"))
@@ -50,6 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("file", type=Path)
     s.add_argument("--types", nargs="*", default=[], help="dotgov: Domain types, e.g. City County")
     s.add_argument("--states", nargs="*", default=[], help="dotgov: two-letter states")
+    s.add_argument("--state", help="osm: the seeds' two-letter state, e.g. MA")
+    s.add_argument("--kind", dest="jkind", help="osm: what the seeds are, e.g. Municipality")
     s.set_defaults(func=cmd_seeds)
 
     c = sub.add_parser("crawl", help="crawl jurisdiction websites for GIS links")
@@ -100,10 +103,41 @@ def build_parser() -> argparse.ArgumentParser:
     cy.add_argument("--no-check", action="store_true", help="skip the check stage")
     cy.set_defaults(func=cmd_cycle)
 
+    rp = sub.add_parser(
+        "replay",
+        help="rebuild harvest history from raw files into a copy of the catalog",
+        description=(
+            "Copy the catalog to --out, then re-run today's harvesters over the raw files, "
+            "oldest first, with each harvest keeping its original time. Each replayed "
+            "endpoint's harvests, assets and history are rebuilt from scratch; nothing is "
+            "fetched and --db is not changed. Check the copy, then swap it in."
+        ),
+    )
+    rp.add_argument("--out", type=Path, required=True, help="new catalog to write (must not exist)")
+    rp.add_argument("--endpoint", nargs="*", default=None, help="only these endpoint ids")
+    rp.add_argument("--since", help="only raw files written on or after this date/time (ISO, UTC)")
+    rp.set_defaults(func=cmd_replay)
+
     k = sub.add_parser("check", help="record whether endpoints are up")
     k.add_argument("--platform", nargs="*", choices=PLATFORMS, default=None)
     k.add_argument("--limit", type=int)
     k.set_defaults(func=cmd_check)
+
+    ch = sub.add_parser(
+        "changes",
+        help="list what changed on endpoints recently",
+        description=(
+            "List, by endpoint, assets that were new, changed, removed or returned, and "
+            "endpoints whose checks failed. An endpoint's first harvest is one line."
+        ),
+    )
+    ch.add_argument(
+        "--since", default="30d", help="a span like 30d, 12h, 2w, or a date (default %(default)s)"
+    )
+    ch.add_argument("--endpoint", nargs="*", default=None, help="endpoint ids")
+    ch.add_argument("--platform", nargs="*", choices=PLATFORMS, default=None)
+    ch.add_argument("--kind", nargs="*", default=None, help="asset kinds, e.g. layer table")
+    ch.set_defaults(func=cmd_changes)
 
     r = sub.add_parser("report", help="summarise the catalog")
     r.set_defaults(func=cmd_report)
@@ -116,7 +150,8 @@ def _fetcher(args) -> Fetcher:
 
 def cmd_seeds(args, store: Store) -> None:
     if args.kind == "osm":
-        n = store.upsert_jurisdictions(seeds.load_osm_seeds(args.file))
+        rows = seeds.load_osm_seeds(args.file, state=args.state, kind=args.jkind)
+        n = store.upsert_jurisdictions(rows)
         print(f"{n} jurisdictions loaded")
     elif args.kind == "dotgov":
         rows = seeds.load_dotgov(args.file, types=args.types, states=args.states)
@@ -204,6 +239,30 @@ def print_cycle_summary(stages: dict) -> None:
         print(f"  {stage:<12} " + ", ".join(f"{k} {tally.get(k, 0)}" for k in keys))
 
 
+def cmd_replay(args, store: Store) -> int:
+    since = None
+    if args.since:
+        since = parse_when(args.since)
+        if since is None:
+            print(f"can't read --since {args.since!r}; use a date like 2026-11-16")
+            return 2
+    if args.out.exists() or args.out.resolve() == args.db.resolve():
+        print(f"{args.out} already exists; replay only writes a new catalog")
+        return 2
+    store.copy_to(args.out)
+    out = Store(args.out)
+    try:
+        totals = asyncio.run(pipeline.run_replay(out, args.raw_dir, ids=args.endpoint, since=since))
+    finally:
+        out.close()
+    print(
+        f"replayed {totals['files']} raw files for {totals['endpoints']} endpoints into "
+        f"{args.out}"
+        + (f" ({totals['skipped']} unreadable files skipped)" if totals["skipped"] else "")
+    )
+    return 0
+
+
 def cmd_check(args, store: Store) -> None:
     platforms = [Platform(p) for p in args.platform] if args.platform else None
 
@@ -219,17 +278,84 @@ def _table(title: str, rows, headers: list[str]) -> None:
     if not rows:
         print("  (none)")
         return
+    _aligned([headers, *rows])
+
+
+def _aligned(rows, indent: str = "  ") -> None:
     data = [[("" if v is None else str(v)) for v in r] for r in rows]
-    widths = [max(len(h), *(len(r[i]) for r in data)) for i, h in enumerate(headers)]
-    print("  " + "  ".join(h.ljust(w) for h, w in zip(headers, widths, strict=True)))
+    widths = [max(len(r[i]) for r in data) for i in range(len(data[0]))]
     for r in data:
-        print("  " + "  ".join(v.ljust(w) for v, w in zip(r, widths, strict=True)))
+        print((indent + "  ".join(v.ljust(w) for v, w in zip(r, widths, strict=True))).rstrip())
+
+
+def _when(iso: str | None) -> str:
+    return iso[:16].replace("T", " ") if iso else ""
+
+
+def cmd_changes(args, store: Store) -> int:
+    since = changes.parse_since(args.since)
+    if since is None:
+        print(f"can't read --since {args.since!r}; use a span like 30d or a date like 2026-11-16")
+        return 2
+    cutoff = since.isoformat(timespec="seconds")
+    filters = {"ids": args.endpoint, "platforms": args.platform}
+    print(f"changes since {_when(cutoff)} UTC")
+
+    endpoints = changes.asset_changes(store, cutoff, kinds=args.kind, **filters)
+    if not endpoints:
+        print("\n  (no asset changes)")
+    for ep in endpoints:
+        print(f"\n{ep.platform}  {ep.endpoint_url}  [{ep.endpoint_id}]")
+        rows = []
+        if ep.first_harvest:
+            at, n = ep.first_harvest
+            rows.append([_when(at), "first harvest", f"{n} assets", "", ""])
+        rows += [
+            [_when(a["observed_at"]), a["change"], a["kind"], a["name"] or a["key"],
+             ", ".join(a["fields"])]
+            for a in ep.assets
+        ]  # fmt: skip
+        _aligned(rows)
+
+    down = changes.health(store, cutoff, **filters)
+    print("\nendpoint health: failed checks")
+    if not down:
+        print("  (none)")
+        return 0
+    _aligned(
+        [
+            [h.state, h.platform, h.endpoint_url, f"{h.failed}/{h.checks} failed",
+             _health_note(h)]
+            for h in down
+        ]
+    )  # fmt: skip
+    return 0
+
+
+def _health_note(h: changes.Health) -> str:
+    if h.state == "recovered":
+        return f"up again {_when(h.latest_at)}"
+    status = f"HTTP {h.http_status}" if h.http_status else (h.detail or "no response")
+    up = f"last up {_when(h.last_up_at)}" if h.last_up_at else "never up"
+    return f"down since {_when(h.down_since)} ({status}; {up})"
 
 
 def cmd_report(args, store: Store) -> None:
     q = store.query
     j = q("SELECT COUNT(*), COUNT(last_crawled_at) FROM jurisdictions")[0]
     print(f"jurisdictions: {j[0]} ({j[1]} crawled)")
+    _table(
+        "coverage: what each jurisdiction's discovery found",
+        [tuple(r) for r in store.coverage()],
+        ["state", "total", "own domain", "linked only", "crawl failed", "nothing found",
+         "not crawled"],
+    )  # fmt: skip
+    _table(
+        "crawl failures",
+        q("""SELECT crawl_failure, COUNT(*) FROM jurisdictions
+             WHERE crawl_failure IS NOT NULL GROUP BY 1 ORDER BY 2 DESC"""),
+        ["reason", "n"],
+    )
     _table(
         "candidates by status",
         q("SELECT status, COUNT(*) FROM candidates GROUP BY 1 ORDER BY 2 DESC"),

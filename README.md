@@ -22,7 +22,7 @@ See [docs/design.md](docs/design.md) for how the pieces fit and what each table 
 uv sync
 
 # Who to look at, and servers already known
-uv run gis-observer seeds osm data/seeds/ma_municipalities.csv            # 349 MA towns (govsearch)
+uv run gis-observer seeds osm data/seeds/ma_municipalities.csv --state MA --kind Municipality  # 349 MA towns (govsearch)
 uv run gis-observer seeds arcgis-servers data/seeds/arcgis_servers_2024.csv  # 518 servers (Munger)
 
 # Find GIS links on town websites, and identify the ones the classifier can't
@@ -53,6 +53,15 @@ Run it weekly on a machine that keeps `data/`; [deploy/README.md](deploy/README.
 a systemd timer and a cron line. Set `GIS_OBSERVER_USER_AGENT` there to something with a
 contact URL.
 
+To see what changed, run `changes`. It lists each endpoint's new, changed, removed and
+returned assets, and the fields that differ for each changed one. An endpoint's first
+harvest shows as one line. Below that it lists endpoints whose latest check failed, or
+that failed and came back up:
+
+```sh
+uv run gis-observer changes --since 30d            # optional: --endpoint ID, --platform P, --kind layer
+```
+
 Other sources:
 
 ```sh
@@ -60,6 +69,13 @@ uv run gis-observer govsearch --url http://localhost:9200 --index govsites   # g
 uv run gis-observer seeds dotgov current-full.csv --types City County --states MA RI
 uv run gis-observer seeds urls athena_results.csv                            # any list of URLs
 uv run gis-observer check                                                    # are endpoints up?
+```
+
+Every response a harvest receives is kept under `data/raw/`. After a parser fix,
+rebuild history from those files into a new catalog without fetching anything:
+
+```sh
+uv run gis-observer replay --out data/replayed.sqlite            # optional: --endpoint ID, --since 2026-11-16
 ```
 
 ## Querying the catalog

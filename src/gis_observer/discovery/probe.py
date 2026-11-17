@@ -2,8 +2,9 @@
 
 In order: resolve ArcGIS Online item links to their organisation; fetch the URL and
 classify where it redirected to; recognise catalog APIs by their JSON shape; scan an
-HTML page (usually a town's "Maps & GIS" page) for links and embedded maps; and as a
-last resort try the conventional paths on gis.* / data.* subdomains.
+HTML page (usually a town's "Maps & GIS" page) for links and embedded maps; recognise
+Hub sites on custom domains; and as a last resort try the conventional paths on
+gis.* / data.* subdomains.
 """
 
 from __future__ import annotations
@@ -12,15 +13,17 @@ import re
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
+from ..arcgis_online import ARCGIS_SHARING, hub_site_org, org_portal
 from ..classify import ITEM_ID, canonical, classify, host_matches
 from ..http import HttpGetter, Response
 from ..models import Endpoint, Platform
 from .links import extract_links
 
-ARCGIS_SHARING = "https://www.arcgis.com/sharing/rest"
 GIS_SUBDOMAINS = {"gis", "maps", "map", "gisweb", "webgis", "geo", "arcgis", "agsweb"}
 DATA_SUBDOMAINS = {"data", "opendata", "gisdata", "hub"}
 CKAN_GENERATOR = re.compile(rb"<meta[^>]+name=[\"']generator[\"'][^>]+content=[\"']ckan", re.I)
+# Hub site pages are built by Hub's "opendata-ui" app and load from hub.arcgis.com.
+HUB_PAGE = re.compile(rb"opendata-ui|hub\.arcgis\.com", re.I)
 
 
 @dataclass
@@ -44,6 +47,8 @@ async def probe(http: HttpGetter, url: str, text: str | None = None) -> ProbeRes
     found += _sniff_json(resp)
     if not found and "html" in resp.headers.get("content-type", "").lower():
         found += await _scan_page(http, resp)
+        if not found and HUB_PAGE.search(resp.content[:200_000]):
+            found += await resolve_hub_site(http, resp.url)
     if not found:
         found += await _well_known(http, resp.url)
     return ProbeResult("found" if found else "none", _dedupe(found))
@@ -68,13 +73,26 @@ async def resolve_arcgis_item(http: HttpGetter, url: str) -> list[Endpoint]:
     if not isinstance(item, dict) or not item.get("orgId"):
         return []
     found = []
-    org = (await http.get(f"{ARCGIS_SHARING}/portals/{item['orgId']}", params={"f": "json"})).json()
-    if isinstance(org, dict) and org.get("urlKey"):
-        domain = org.get("customBaseUrl") or "maps.arcgis.com"
-        portal = canonical(f"https://{org['urlKey']}.{domain}")  # urlKey can be mixed case
+    if portal := await org_portal(http, item["orgId"]):
         found.append(Endpoint(Platform.ARCGIS_PORTAL, portal))
     if item.get("url") and (ep := classify(item["url"])) is not None:
         found.append(ep)
+    return found
+
+
+async def resolve_hub_site(http: HttpGetter, url: str) -> list[Endpoint]:
+    """A Hub site on a custom domain (gis.data.mass.gov): its feed and its owner's portal.
+
+    The portal is the fallback for when the site's feed is broken.
+    """
+    org_id = await hub_site_org(http, url)
+    if not org_id:
+        return []
+    parts = urlsplit(url)
+    feed = canonical(f"{parts.scheme}://{parts.netloc}/api/feed/dcat-us/1.1.json")
+    found = [Endpoint(Platform.DCAT, feed, vendor="ArcGIS Hub")]
+    if portal := await org_portal(http, org_id):
+        found.append(Endpoint(Platform.ARCGIS_PORTAL, portal))
     return found
 
 

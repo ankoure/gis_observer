@@ -4,7 +4,8 @@ The politeness rules come from both parent projects: the 2024 ArcGIS harvester w
 a multiple of the last response time before hitting the same server again, and
 govsearch's Scrapy settings retried 429/5xx and kept per-host concurrency low. Here
 each host gets one request at a time, then a pause of `politeness` x the last
-response time (at least `min_delay`).
+response time (at least `min_delay`, at most `max_delay`). The cap matters for
+timeouts: without it a 30 s timeout would hold the host for another 45 s.
 
 Failures come back as a `Response` with `error` set rather than as exceptions, so a
 harvester can record what failed and keep going.
@@ -27,6 +28,7 @@ import httpx
 DEFAULT_USER_AGENT = os.environ.get("GIS_OBSERVER_USER_AGENT", "gis-observer/0.1")
 RETRY_STATUSES = {408, 429, 500, 502, 503, 504, 522, 524}
 RETRY_ERRORS = ("ReadTimeout", "ConnectTimeout", "PoolTimeout", "RemoteProtocolError")
+TIMEOUT_ERRORS = ("ReadTimeout", "ConnectTimeout", "PoolTimeout")
 
 
 @dataclass
@@ -71,7 +73,9 @@ class Fetcher:
         timeout: float = 30.0,
         politeness: float = 1.5,
         min_delay: float = 0.25,
+        max_delay: float = 10.0,
         max_retries: int = 2,
+        max_timeout_retries: int = 1,
         max_bytes: int = 50_000_000,
         insecure_tls_fallback: bool = True,
         transport: httpx.AsyncBaseTransport | None = None,
@@ -79,7 +83,11 @@ class Fetcher:
         self.user_agent = user_agent
         self.politeness = politeness
         self.min_delay = min_delay
+        self.max_delay = max_delay
         self.max_retries = max_retries
+        # A server that timed out once will probably time out again, and each attempt
+        # costs a full `timeout`, so timeouts get fewer retries than error statuses.
+        self.max_timeout_retries = max_timeout_retries
         self.max_bytes = max_bytes
         # Lots of government servers have broken certificate chains. Retrying without
         # verification is fine for reading public catalogs; the response is flagged.
@@ -122,8 +130,9 @@ class Fetcher:
                 if wait > 0:
                     await asyncio.sleep(wait)
                 resp = await self._send(method, url, params, limit)
-                pause = max(self.min_delay, resp.elapsed * self.politeness)
-                retry = attempt < self.max_retries and _retryable(resp)
+                pause = min(self.max_delay, max(self.min_delay, resp.elapsed * self.politeness))
+                allowed = self.max_timeout_retries if _timed_out(resp) else self.max_retries
+                retry = attempt < min(allowed, self.max_retries) and _retryable(resp)
                 if retry:
                     pause = max(pause, _backoff(resp, attempt))
                 self._next_ok[host] = time.monotonic() + pause
@@ -183,6 +192,10 @@ def _failed(url: str, exc: Exception, start: float) -> Response:
 
 def _retryable(resp: Response) -> bool:
     return resp.status in RETRY_STATUSES or (resp.error or "").startswith(RETRY_ERRORS)
+
+
+def _timed_out(resp: Response) -> bool:
+    return (resp.error or "").startswith(TIMEOUT_ERRORS)
 
 
 def _backoff(resp: Response, attempt: int) -> float:

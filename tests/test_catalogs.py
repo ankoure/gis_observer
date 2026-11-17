@@ -5,6 +5,7 @@ import asyncio
 import httpx
 from helpers import collect, make_fetcher
 
+from gis_observer.classify import classify
 from gis_observer.harvesters import Harvester
 from gis_observer.models import Asset, Candidate, Endpoint, Platform
 
@@ -176,6 +177,32 @@ def test_dcat_hub_feed():
     assert assets[0].bbox == (-71.185, 42.2312, -70.9245, 42.3951)
     assert assets[0].source_updated_at.isoformat() == "2024-05-13T13:40:53+00:00"
     assert len([i for i in items if isinstance(i, Candidate)]) == 1
+
+
+def test_broken_hub_feed_leads_to_the_owning_org():
+    # East Longmeadow's real failure: the site is up but its catalog isn't configured.
+    broken = httpx.Response(400, json={"error": "Site catalog is not configured correctly."})
+    routes = {
+        FEED: broken,
+        "https://hub.arcgis.com/api/v3/domains/town-hub.opendata.arcgis.com": {
+            "siteId": "0c6199d2cbbf4acfaff09050181cb25b", "orgId": "ORG1", "orgKey": "Town",
+        },
+        "https://www.arcgis.com/sharing/rest/portals/ORG1": {
+            "id": "ORG1", "urlKey": "Town", "customBaseUrl": "maps.arcgis.com",
+        },
+    }  # fmt: skip
+    h, items = _run(Platform.DCAT, FEED, routes)
+    assert h.errors == [f"{FEED}: HTTP 400"]  # still a failed harvest
+    (lead,) = items
+    assert isinstance(lead, Candidate)
+    assert (lead.url, lead.found_on) == ("https://town.maps.arcgis.com", FEED)
+    assert classify(lead.url).platform is Platform.ARCGIS_PORTAL
+
+
+def test_broken_non_hub_feed_has_no_fallback():
+    url = "https://data.town.gov/data.json"
+    h, items = _run(Platform.DCAT, url, {})
+    assert (h.errors, items) == ([f"{url}: HTTP 404"], [])
 
 
 def test_file_headers_only():

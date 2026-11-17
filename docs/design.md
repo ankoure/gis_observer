@@ -53,7 +53,9 @@ A new platform is one module in `harvesters/` subclassing `Harvester` with a
 
 ## Data model (SQLite, `store.py`)
 
-- `jurisdictions`: who we look at.
+- `jurisdictions`: who we look at. `crawl_pages` and `crawl_failure` record the last
+  crawl's outcome: pages fetched, and when there were none, why (`blocked` for a 403
+  or a Cloudflare challenge, `dead`, `robots`, `http_<status>`, `not_html`, `error`).
 - `candidates`: every URL found, where it was found, its status
   (`new` → `classified` | `found` | `none` | `dead`), and the endpoint it led to.
 - `endpoints`: catalog roots, keyed by `sha1(platform|url)`, with how they were found.
@@ -68,11 +70,25 @@ A new platform is one module in `harvesters/` subclassing `Harvester` with a
 - `checks`: up/down history (ported from the Munger's `server_check.py` /
   `health_check.py`).
 - `current_assets` (view): live assets joined to their endpoint.
+- `jurisdiction_assets` (view): `current_assets` for each jurisdiction that points at
+  the endpoint, with the `relation`. For example:
+
+  ```sql
+  SELECT jurisdiction_name, relation, platform, endpoint_url, name, format
+  FROM jurisdiction_assets
+  WHERE state = 'MA' AND lower(name) LIKE '%parcel%';
+  ```
+
+`report` puts each jurisdiction in one coverage group: an endpoint on its own domain,
+only links to endpoints elsewhere, crawl failed, nothing found, or not crawled yet.
+Towns crawled before crawl outcomes were recorded count as "nothing found" until
+`crawl --recrawl`.
 
 **Change rules.** An asset changes when its normalised record's hash changes. That
 includes edits to name, description, fields, extent, or the source's last-edit date.
 Only a complete harvest (no errors) can mark assets removed: after a partial one, a
-missing asset may only be behind a request that failed. A secured service is not an
+missing asset may only be behind a request that failed. It takes two complete
+harvests in a row missing an asset (see flapping, below). A secured service is not an
 error; it's recorded with `extra.access = "restricted"`.
 
 **Why SQLite.** At this scale (hundreds of thousands of assets) the catalog is mostly
@@ -80,27 +96,50 @@ upserts and needs no server. All SQL is in `store.py`, so moving to PostGIS (whe
 2024 tables lived, on Crunchy Bridge) means rewriting one module. DuckDB can attach
 the file directly for analysis.
 
-**Known issue: flapping behind load balancers.** Some servers have nodes out of sync.
-MassGIS's GeoServer returned capabilities with `updateSequence` 27440 (801 WFS
-feature types) and 27784 (804) on back-to-back requests. Two harvests a minute apart
-then report layers as new, changed and removed. The OGC service asset records
-`updateSequence` so this can be seen. If it becomes a nuisance, one option is to only
-report a removal once an asset has been missing for two consecutive complete harvests.
+**Flapping behind load balancers.** Some servers have nodes out of sync. MassGIS's
+GeoServer returned capabilities with `updateSequence` 27440 (801 WFS feature types)
+and 27784 (804) on back-to-back requests, so two harvests a minute apart would report
+layers removed and then returned. The OGC service asset records `updateSequence` so
+this can be seen. To keep that out of the history, the first complete harvest that
+misses an asset only sets `assets.missed_at`. The asset is marked removed (with a
+`removed` version row) only when the next complete harvest misses it too; if that one
+finds it, the miss is cleared and no version rows are written. Partial harvests
+neither record nor clear misses. Layers that only appear on some nodes can still show
+up as `new` and later as removed, and content can still flip between `changed`
+versions.
 
 ## Raw landing zone
 
 Each harvest writes every response it received to
 `data/raw/<platform>/<endpoint id>/<UTC timestamp>.jsonl.gz`. That matches the old
-Airflow DAGs' `s3://restservicejson/{date}/{type}/{server}/{service}.json`. A parser
-fix can be replayed over history without re-fetching. Moving this to S3 later means
-replacing `RawCapture.write`.
+Airflow DAGs' `s3://restservicejson/{date}/{type}/{server}/{service}.json`. Moving
+this to S3 later means replacing `RawCapture.write`.
+
+**Replay.** `gis-observer replay --out NEW.sqlite [--endpoint ID ...] [--since DATE]`
+re-runs today's harvesters over the raw files without fetching anything, so a parser
+fix can be applied to history. `ReplayFetcher` stands in for the network: it answers
+each request from the raw file, matched on method, requested URL and params. A
+request the file doesn't have (a fixed parser asking for something new) fails, so
+that harvest is partial and can't mark assets removed.
+
+- Replay writes a copy. `--out` gets a copy of `--db` (which is never changed) and
+  must not exist yet. Check the copy, then swap it in. Rewriting history in place
+  would mix old and new parses if a replay stopped halfway.
+- Each endpoint with raw files starts over. Its harvests, assets and versions are
+  dropped, then its files are replayed oldest first. Endpoints without raw files keep
+  what they had. `--since` skips older files, so that endpoint's history starts at
+  that date.
+- Harvests keep their original dates. A harvest's start is the first response's
+  `fetched_at`; its finish, and the `observed_at` of its changes, is the file's
+  timestamp.
 
 ## Politeness
 
 - One request at a time per host, then a pause of 1.5 × the last response time
-  (minimum 0.25 s). The 1.5× rule is the Munger's `time.sleep(elapsed * 1.5)`.
-- Retries on 408/429/5xx and timeouts, honouring `Retry-After`. These are govsearch's
-  retry codes.
+  (minimum 0.25 s, maximum 10 s). The 1.5× rule is the Munger's
+  `time.sleep(elapsed * 1.5)`. The cap stops a 30 s timeout turning into a 45 s wait.
+- Retries on 408/429/5xx (twice) and timeouts (once), with exponential backoff and
+  honouring `Retry-After`. These are govsearch's retry codes.
 - The crawler obeys robots.txt (RFC 9309: a 4xx robots.txt means no rules, a 5xx
   means stay out). Harvesters call documented public catalog APIs and don't consult
   robots.txt.

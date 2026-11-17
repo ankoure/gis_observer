@@ -10,8 +10,15 @@ from ..classify import classify
 from ..models import Candidate, Endpoint, Jurisdiction, Platform
 
 
-def load_osm_seeds(path: Path) -> list[Jurisdiction]:
-    """govsearch's seeds.csv: `@id,source_name,website`, one row per OSM boundary relation."""
+def load_osm_seeds(
+    path: Path, *, state: str | None = None, kind: str | None = None
+) -> list[Jurisdiction]:
+    """govsearch's seeds.csv: `@id,source_name,website`, one row per OSM boundary relation.
+
+    The file doesn't say which state the towns are in or what they are, so the caller
+    does (`state="MA", kind="Municipality"`).
+    """
+    state = state.strip().upper() if state else None
     out = []
     with open(path, newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
@@ -23,6 +30,8 @@ def load_osm_seeds(path: Path) -> list[Jurisdiction]:
                     id=f"osm:{osm_id}",
                     name=name,
                     website=_site(row.get("website")),
+                    kind=kind or None,
+                    state=state,
                     source="govsearch-seeds",
                 )
             )
