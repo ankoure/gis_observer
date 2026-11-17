@@ -86,6 +86,10 @@ A new platform is one module in `harvesters/` subclassing `Harvester` with a
 - `checks`: up/down history (ported from the Munger's `server_check.py` /
   `health_check.py`).
 - `current_assets` (view): live assets joined to their endpoint.
+- `endpoint_failures` (view): failed harvests since each endpoint last answered (an
+  `ok` or `partial` harvest). `harvest` skips endpoints with 3 or more until 30 days
+  after the last failure, or until a `check` succeeds after it. Nothing is stored, so
+  one good harvest resets the count.
 - `jurisdiction_assets` (view): `current_assets` for each jurisdiction that points at
   the endpoint, with the `relation`. For example:
 

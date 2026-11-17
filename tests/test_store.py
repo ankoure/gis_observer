@@ -1,10 +1,11 @@
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 from helpers import make_fetcher
 
 from gis_observer import pipeline
 from gis_observer.models import Asset, Candidate, Endpoint, Jurisdiction, Platform
-from gis_observer.store import Store
+from gis_observer.store import FailurePolicy, Store
 
 EP = Endpoint(Platform.ARCGIS_REST, "https://gis.town.gov/arcgis/rest/services")
 
@@ -306,3 +307,81 @@ def test_old_viewer_ids_are_merged(tmp_path):
     assert [tuple(r) for r in links] == [(ep.id, "osm:1")]
     cands = store.query("SELECT DISTINCT endpoint_id FROM candidates")
     assert [r[0] for r in cands] == [ep.id]
+
+
+def _harvest(store, endpoint_id, status, finished_at):
+    hid = store.start_harvest(endpoint_id)
+    store.finish_harvest(
+        hid, endpoint_id, status=status, counts={"new": 0, "changed": 0, "removed": 0},
+        n_assets=0, n_candidates=0, errors=["https://x: timed out"] if status == "failed" else [],
+        raw_path=None,
+    )  # fmt: skip
+    store.db.execute("UPDATE harvests SET finished_at = ? WHERE id = ?", (finished_at, hid))
+    store.commit()
+
+
+def _ago(days):
+    return (datetime.now(UTC) - timedelta(days=days)).isoformat(timespec="seconds")
+
+
+def test_failing_endpoints_are_skipped_until_retry_or_check():
+    store = Store(":memory:")
+    dead = Endpoint(Platform.ARCGIS_REST, "https://dead.gov/arcgis/rest/services")
+    flaky = Endpoint(Platform.ARCGIS_REST, "https://flaky.gov/arcgis/rest/services")
+    old = Endpoint(Platform.ARCGIS_REST, "https://old.gov/arcgis/rest/services")
+    for ep in (dead, flaky, old):
+        store.upsert_endpoint(ep)
+    for days in (3, 2, 1):
+        _harvest(store, dead.id, "failed", _ago(days))
+    # two failures, an answer, then two more: the run was broken, so not skipped
+    for days, status in (
+        (5, "failed"),
+        (4, "failed"),
+        (3, "partial"),
+        (2, "failed"),
+        (1, "failed"),
+    ):
+        _harvest(store, flaky.id, status, _ago(days))
+    for days in (50, 45, 40):  # skipped once, but the retry period has passed
+        _harvest(store, old.id, "failed", _ago(days))
+
+    policy = FailurePolicy(max_failures=3, retry_after_days=30)
+    failing = store.failing_endpoints(policy)
+    assert [(r["url"], r["consecutive_failures"]) for r in failing] == [(dead.url, 3)]
+    assert {e.id for e in store.endpoints(skip_failing=policy)} == {flaky.id, old.id}
+    assert [e.id for e in store.endpoints(only_failing=policy)] == [dead.id]
+    assert len(store.endpoints()) == 3
+
+    # a successful check after the last failure brings it back; a failed one doesn't
+    class Resp:
+        status, ok, elapsed, tls_insecure = 200, True, 0.1, False
+
+    store.record_check(dead.id, Resp, "error 500", ok=False)
+    assert store.failing_endpoints(policy)
+    store.record_check(dead.id, Resp, "10.81")
+    assert not store.failing_endpoints(policy)
+
+    # ...until it fails again
+    _harvest(store, dead.id, "failed", _ago(0))
+    assert [r["consecutive_failures"] for r in store.failing_endpoints(policy)] == [4]
+
+
+def test_run_harvest_skips_failing_unless_included_or_named(tmp_path):
+    store = Store(":memory:")
+    store.upsert_endpoint(EP)
+    for days in (3, 2, 1):
+        _harvest(store, EP.id, "failed", _ago(days))
+    store.db.execute("UPDATE endpoints SET last_harvest_at = ?", (_ago(30),))
+
+    def run(**kw):
+        async def go():
+            async with make_fetcher({}) as http:
+                await pipeline.run_harvest(store, http, tmp_path, older_than_days=7, **kw)
+
+        before = store.query("SELECT COUNT(*) FROM harvests")[0][0]
+        asyncio.run(go())
+        return store.query("SELECT COUNT(*) FROM harvests")[0][0] - before
+
+    assert run() == 0
+    assert run(failure_policy=None) == 1
+    assert run(ids=[EP.id]) == 1

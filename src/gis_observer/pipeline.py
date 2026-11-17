@@ -23,10 +23,12 @@ from .harvesters import Harvester
 from .http import Fetcher, HttpGetter
 from .models import Asset, Candidate, Endpoint, Platform
 from .raw import RawCapture, ReplayFetcher, raw_files, raw_path
-from .store import Store
+from .store import FailurePolicy, Store
 from .util import utcnow
 
 log = logging.getLogger(__name__)
+
+DEFAULT_FAILURE_POLICY = FailurePolicy()
 
 
 def attach(
@@ -140,16 +142,31 @@ async def run_harvest(
     store: Store, fetcher: Fetcher, raw_dir: Path, *, platforms: list[Platform] | None = None,
     ids: list[str] | None = None, older_than_days: float | None = 7, limit=None, concurrency=6,
     linked_only: bool = False,
+    failure_policy: FailurePolicy | None = DEFAULT_FAILURE_POLICY,
 ) -> Counter:  # fmt: skip
-    """Harvest endpoints that are due. Returns a tally of statuses and asset/lead counts."""
+    """Harvest endpoints that are due. Returns a tally of statuses and asset/lead counts.
+
+    Endpoints that keep failing are skipped under `failure_policy` (None includes
+    them). Naming endpoints with `ids` ignores both the age cutoff and the policy.
+    """
     harvestable = [p for p in (platforms or Harvester.platforms()) if p in Harvester.platforms()]
     cutoff = None
     if older_than_days and older_than_days > 0 and not ids:  # 0 means harvest everything
         cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat(timespec="seconds")
+    policy = None if ids else failure_policy
     endpoints = store.endpoints(
-        platforms=harvestable, ids=ids, older_than=cutoff, linked_only=linked_only, limit=limit
+        platforms=harvestable, ids=ids, older_than=cutoff, linked_only=linked_only,
+        skip_failing=policy, limit=limit,
     )  # fmt: skip
-    log.info("harvesting %d endpoints", len(endpoints))
+    if policy:
+        n_skipped = len(store.failing_endpoints(policy))
+        log.info(
+            "harvesting %d endpoints (%d skipped after %d+ failures in a row; "
+            "--include-failing to try them)",
+            len(endpoints), n_skipped, policy.max_failures,
+        )  # fmt: skip
+    else:
+        log.info("harvesting %d endpoints", len(endpoints))
     tally: Counter = Counter(endpoints=len(endpoints))
     async for _ep, _ in _bounded(
         endpoints, lambda ep: harvest_one(store, fetcher, raw_dir, ep, tally), concurrency
@@ -280,10 +297,14 @@ def _check_request(ep: Endpoint) -> tuple[str, dict | None, int]:
 
 
 async def run_check(
-    store: Store, fetcher: Fetcher, *, platforms=None, limit=None, concurrency=8
-) -> Counter:
-    """Record whether endpoints respond. Returns a tally of `up` and `down`."""
-    endpoints = store.endpoints(platforms=platforms, limit=limit)
+    store: Store, fetcher: Fetcher, *, platforms=None, limit=None, concurrency=8,
+    only_failing: FailurePolicy | None = None,
+) -> Counter:  # fmt: skip
+    """Record whether endpoints respond. Returns a tally of `up` and `down`.
+
+    A successful check brings back an endpoint skipped for failing.
+    """
+    endpoints = store.endpoints(platforms=platforms, only_failing=only_failing, limit=limit)
     tally: Counter = Counter(endpoints=len(endpoints))
 
     async def check(ep):
@@ -293,15 +314,17 @@ async def run_check(
     async for ep, resp in _bounded(endpoints, check, concurrency):
         data = resp.json() if resp.content else None
         detail = None
+        ok = resp.ok
         if isinstance(data, dict):
             detail = str(
                 data.get("currentVersion") or data.get("ckan_version") or data.get("id") or ""
             )
             if "error" in data:
                 detail = f"error {data['error']}"
-        store.record_check(ep.id, resp, detail or resp.error)
+                ok = False
+        store.record_check(ep.id, resp, detail or resp.error, ok=ok)
         store.commit()
-        tally["up" if resp.ok else "down"] += 1
+        tally["up" if ok else "down"] += 1
         log.info("%s %s -> %s %s", ep.platform, ep.url, resp.status, detail or resp.error or "")
     return tally
 
