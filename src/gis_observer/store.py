@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS assets (
     first_seen TEXT NOT NULL,
     last_seen TEXT NOT NULL,
     removed_at TEXT,
+    missed_at TEXT,                       -- a complete harvest missed it; removed if the next does
     PRIMARY KEY (endpoint_id, key)
 );
 CREATE INDEX IF NOT EXISTS assets_kind ON assets(kind);
@@ -138,6 +139,7 @@ CREATE VIEW IF NOT EXISTS jurisdiction_assets AS
 MIGRATIONS = (
     ("jurisdictions", "crawl_pages", "INTEGER"),
     ("jurisdictions", "crawl_failure", "TEXT"),
+    ("assets", "missed_at", "TEXT"),
 )
 
 ASSET_COLUMNS = (
@@ -343,14 +345,19 @@ class Store:
         """Write one harvest's assets and record what changed since the last one.
 
         Only a complete harvest can mark assets removed; after a partial one, missing
-        assets may just be behind a request that failed. `observed_at` defaults to now;
+        assets may just be behind a request that failed. Even then, the first complete
+        harvest to miss an asset only records the miss (`missed_at`): it's removed when
+        the next complete harvest misses it too, and the miss is cleared if that one
+        finds it. Servers behind out-of-sync load balancers otherwise report layers
+        removed and returned on back-to-back runs. Partial harvests leave misses
+        alone. `observed_at` defaults to now;
         a replay passes the original harvest's time so history keeps its dates.
         """
         now = observed_at or utcnow()
         existing = {
-            r["key"]: (r["content_hash"], r["removed_at"])
+            r["key"]: (r["content_hash"], r["removed_at"], r["missed_at"])
             for r in self.db.execute(
-                "SELECT key, content_hash, removed_at FROM assets WHERE endpoint_id = ?",
+                "SELECT key, content_hash, removed_at, missed_at FROM assets WHERE endpoint_id = ?",
                 (endpoint_id,),
             )
         }
@@ -398,9 +405,24 @@ class Store:
             rows,
         )
         if complete:
-            gone = [k for k, (_, removed) in existing.items() if removed is None and k not in seen]
+            found = [k for k, (_, _, missed) in existing.items() if missed and k in seen]
+            missing = [
+                (k, missed)
+                for k, (_, removed, missed) in existing.items()
+                if removed is None and k not in seen
+            ]
+            gone = [k for k, missed in missing if missed]
             self.db.executemany(
-                "UPDATE assets SET removed_at = ? WHERE endpoint_id = ? AND key = ?",
+                "UPDATE assets SET missed_at = NULL WHERE endpoint_id = ? AND key = ?",
+                [(endpoint_id, k) for k in found],
+            )
+            self.db.executemany(
+                "UPDATE assets SET missed_at = ? WHERE endpoint_id = ? AND key = ?",
+                [(now, endpoint_id, k) for k, missed in missing if not missed],
+            )
+            self.db.executemany(
+                """UPDATE assets SET removed_at = ?, missed_at = NULL
+                   WHERE endpoint_id = ? AND key = ?""",
                 [(now, endpoint_id, k) for k in gone],
             )
             versions += [(endpoint_id, k, harvest_id, now, "removed", None, None) for k in gone]

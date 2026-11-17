@@ -87,7 +87,8 @@ Towns crawled before crawl outcomes were recorded count as "nothing found" until
 **Change rules.** An asset changes when its normalised record's hash changes. That
 includes edits to name, description, fields, extent, or the source's last-edit date.
 Only a complete harvest (no errors) can mark assets removed: after a partial one, a
-missing asset may only be behind a request that failed. A secured service is not an
+missing asset may only be behind a request that failed. It takes two complete
+harvests in a row missing an asset (see flapping, below). A secured service is not an
 error; it's recorded with `extra.access = "restricted"`.
 
 **Why SQLite.** At this scale (hundreds of thousands of assets) the catalog is mostly
@@ -95,12 +96,17 @@ upserts and needs no server. All SQL is in `store.py`, so moving to PostGIS (whe
 2024 tables lived, on Crunchy Bridge) means rewriting one module. DuckDB can attach
 the file directly for analysis.
 
-**Known issue: flapping behind load balancers.** Some servers have nodes out of sync.
-MassGIS's GeoServer returned capabilities with `updateSequence` 27440 (801 WFS
-feature types) and 27784 (804) on back-to-back requests. Two harvests a minute apart
-then report layers as new, changed and removed. The OGC service asset records
-`updateSequence` so this can be seen. If it becomes a nuisance, one option is to only
-report a removal once an asset has been missing for two consecutive complete harvests.
+**Flapping behind load balancers.** Some servers have nodes out of sync. MassGIS's
+GeoServer returned capabilities with `updateSequence` 27440 (801 WFS feature types)
+and 27784 (804) on back-to-back requests, so two harvests a minute apart would report
+layers removed and then returned. The OGC service asset records `updateSequence` so
+this can be seen. To keep that out of the history, the first complete harvest that
+misses an asset only sets `assets.missed_at`. The asset is marked removed (with a
+`removed` version row) only when the next complete harvest misses it too; if that one
+finds it, the miss is cleared and no version rows are written. Partial harvests
+neither record nor clear misses. Layers that only appear on some nodes can still show
+up as `new` and later as removed, and content can still flip between `changed`
+versions.
 
 ## Raw landing zone
 
