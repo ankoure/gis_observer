@@ -247,8 +247,19 @@ class Store:
         platforms: Iterable[Platform] | None = None,
         ids: Iterable[str] | None = None,
         older_than: str | None = None,
+        seen_since: str | None = None,
+        never_harvested: bool = False,
+        linked_only: bool = False,
         limit: int | None = None,
     ) -> list[Endpoint]:
+        """Endpoints in harvest order: never harvested first, then least recently.
+
+        Among endpoints never harvested, those a jurisdiction links to come first, so a
+        limited harvest reaches what the crawler found before a bulk import's backlog.
+        """
+        linked = (
+            "EXISTS (SELECT 1 FROM endpoint_jurisdictions ej WHERE ej.endpoint_id = endpoints.id)"
+        )
         clauses, params = [], []
         if platforms:
             plats = [p.value for p in platforms]
@@ -261,10 +272,18 @@ class Store:
         if older_than:
             clauses.append("(last_harvest_at IS NULL OR last_harvest_at < ?)")
             params.append(older_than)
+        if seen_since:
+            clauses.append("first_seen >= ?")
+            params.append(seen_since)
+        if never_harvested:
+            clauses.append("last_harvest_at IS NULL")
+        if linked_only:
+            clauses.append(linked)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self.db.execute(
             f"""SELECT * FROM endpoints {where}
-                ORDER BY last_harvest_at IS NOT NULL, last_harvest_at, first_seen LIMIT ?""",
+                ORDER BY last_harvest_at IS NOT NULL, last_harvest_at, NOT {linked}, first_seen
+                LIMIT ?""",
             (*params, limit if limit else -1),
         ).fetchall()
         return [Endpoint(Platform(r["platform"]), r["url"], r["vendor"], r["label"]) for r in rows]
