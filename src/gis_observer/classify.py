@@ -33,10 +33,14 @@ VIEWER_HOSTS = {
     "mapsonline.net": "PeopleGIS MapsOnline",
     "schneidercorp.com": "Schneider Beacon",
     "qpublic.net": "Schneider qPublic",
+    # Each viewer's assets/js/settings.js names a public ArcGIS Server folder on
+    # hostingdataN.tighebond.com (e.g. .../arcgis/rest/services/PalmerMA), so these could
+    # be followed to real services later.
+    "hosting.tighebond.com": "Tighe & Bond",
     "vgsi.com": "Vision Government Solutions",  # assessor database with parcel maps
 }
 # One viewer per first path segment (the town), e.g. axisgis.com/ChesterMA/.
-PATH_SCOPED_VIEWERS = {"axisgis.com", "mapsonline.net", "vgsi.com"}
+PATH_SCOPED_VIEWERS = {"axisgis.com", "hosting.tighebond.com", "mapsonline.net", "vgsi.com"}
 
 # Consumer map and social sites a town links to for directions or news; never a data source.
 NOT_GIS = (
