@@ -148,3 +148,26 @@ def test_jurisdiction_assets_and_coverage():
         {"state": "MA", "total": 5, "own_domain": 1, "linked_only": 1, "crawl_failed": 1,
          "nothing_found": 1, "not_crawled": 1},
     ]  # fmt: skip
+
+
+def test_imported_urls_are_attributed_by_host():
+    store = Store(":memory:")
+    store.upsert_jurisdictions(
+        [
+            Jurisdiction("osm:1", "Holland", "https://www.holland-ma.gov"),
+            Jurisdiction("osm:2", "Twin A", "https://shared.org"),
+            Jurisdiction("osm:3", "Twin B", "https://www.shared.org"),
+        ]
+    )
+    cands = store.attribute_by_host(
+        [
+            Candidate("https://gis.holland-ma.gov/arcgis/rest/services", "import:cc.csv"),
+            Candidate("https://holland-ma.gov/maps", "import:cc.csv"),
+            Candidate("https://shared.org/gis", "import:cc.csv"),
+            Candidate("https://notholland-ma.gov/gis", "import:cc.csv"),
+            Candidate("https://holland-ma.gov/gis", "import:cc.csv", jurisdiction_id="osm:9"),
+        ]
+    )
+    assert [c.jurisdiction_id for c in cands] == ["osm:1", "osm:1", None, None, "osm:9"]
+    pipeline.ingest_candidates(store, cands)
+    assert store.coverage()[0]["own_domain"] == 1

@@ -49,6 +49,22 @@ uv run gis-observer seeds urls athena_results.csv                            # a
 uv run gis-observer check                                                    # are endpoints up?
 ```
 
+### Towns the crawler can't reach
+
+`report` counts crawl failures by reason. `blocked` means the start page answered
+403 or with Cloudflare's "Just a moment..." JavaScript challenge. The crawler does not
+try to get past it. `dead` means the connection failed, and `robots` means robots.txt
+disallows the site. Cover blocked towns from other sources instead:
+
+- `gis-observer govsearch`, if govsearch indexed the town before it was blocked.
+- Common Crawl: `sql/athena/04_blocked_town_gis_urls.sql` finds GIS-looking URLs on
+  the blocked towns' domains. Load the results with `seeds urls`, which attributes each
+  URL to the town whose site it is on, then run `probe`.
+
+List them with
+`sqlite3 data/observer.sqlite "SELECT name, website, crawl_failure FROM jurisdictions WHERE crawl_failure IS NOT NULL"`.
+Run `crawl --recrawl` to try again later.
+
 Every response a harvest receives is kept under `data/raw/`. After a parser fix,
 rebuild history from those files into a new catalog without fetching anything:
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Iterable
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -199,6 +200,34 @@ class Store:
         )
         self.db.commit()
         return cur.rowcount
+
+    def attribute_by_host(self, candidates: Iterable[Candidate]) -> list[Candidate]:
+        """Give unattributed candidates the jurisdiction whose website they sit on.
+
+        For imported URL lists (Common Crawl, govsearch exports), which carry no
+        jurisdiction. A URL matches a site on the same host or a subdomain of it
+        (gis.town.gov belongs to town.gov). Hosts shared by two jurisdictions stay
+        unattributed.
+        """
+        owners: dict[str, str | None] = {}
+        for row in self.db.execute(
+            "SELECT id, website FROM jurisdictions WHERE website IS NOT NULL"
+        ):
+            site = _bare_host(row["website"])
+            if site:
+                owners[site] = None if site in owners else row["id"]
+        out = []
+        for c in candidates:
+            if c.jurisdiction_id is None:
+                host = _bare_host(c.url)
+                labels = host.split(".")
+                for i in range(len(labels) - 1):  # gis.town.gov, then town.gov
+                    suffix = ".".join(labels[i:])
+                    if suffix in owners:
+                        c = replace(c, jurisdiction_id=owners[suffix])
+                        break
+            out.append(c)
+        return out
 
     def jurisdictions_to_crawl(
         self, limit: int | None, recrawl: bool = False

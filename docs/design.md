@@ -25,7 +25,8 @@ over time. It does not download the features themselves.
    - `crawl`: the jurisdiction's own site, GIS-looking links first, iframes included,
      robots.txt obeyed.
    - `govsearch`: the `gis_links` govsearch already stored in OpenSearch.
-   - `seeds urls`: anything else, such as Athena results from `sql/athena/`.
+   - `seeds urls`: anything else, such as Athena results from `sql/athena/`. URLs are
+     attributed to the jurisdiction whose website host they sit on.
 3. **Classify** maps a URL to a platform and a canonical endpoint root, without
    touching the network (`classify.py`). For example,
    `.../rest/services/X/MapServer/3/query` becomes that server's `.../rest/services`.
